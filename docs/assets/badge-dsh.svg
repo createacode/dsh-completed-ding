@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="180" height="28" viewBox="0 0 180 28" role="img" aria-label="DSH: Web and Desktop">
+  <rect width="180" height="28" rx="4" fill="#3b2a1e"/>
+  <rect x="52" width="128" height="28" rx="4" fill="#4d6bfe"/>
+  <rect x="52" width="4" height="28" fill="#4d6bfe"/>
+  <text x="26" y="18" text-anchor="middle" fill="#fff8ec" font-family="Segoe UI, Microsoft YaHei, sans-serif" font-size="11" font-weight="600">DSH</text>
+  <text x="116" y="18" text-anchor="middle" fill="#fff8ec" font-family="Segoe UI, Microsoft YaHei, sans-serif" font-size="11" font-weight="700">Web &amp; Desktop</text>
+</svg>

@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Session Completion Alert",
+    "description": "A bottom-right notice for completed, failed, or waiting-for-answer sessions, with accurate quota, network, and sign-in reasons; bundled or custom audio and workspace folder opening."
+  }
+}
