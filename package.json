@@ -1,8 +1,8 @@
 {
   "name": "dsh-completed-ding",
-  "version": "1.0.0",
+  "version": "1.5.4",
   "private": true,
-  "description": "A warm honey-toned bottom-right alert for completed, failed, or waiting-for-answer sessions, with accurate failure reasons, bundled or custom audio, and workspace folder opening.",
+  "description": "A warm bottom-right alert for completed, failed, or waiting-for-answer sessions, switchable between in-app cards, desktop notifications, and a floating window, with audio, workspace opening, and one-click or daily automatic Gitee updates.",
   "type": "module",
   "exports": {
     ".": "./index.js",

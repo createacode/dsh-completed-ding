@@ -36,25 +36,25 @@
 | 项目 | 值 |
 | --- | --- |
 | 包名 | `dsh-completed-ding` |
-| 包版本 | `1.0.0` |
+| 包版本 | `1.5.4` |
 | 类型 | ESM / 无构建 |
-| Host 入口 | `index.js`（空实现） |
+| Host 入口 | `index.js`（Gitee 更新路由 + Windows 前台全屏检测） |
 | Client 入口 | `client.js` |
 | Bundle 入口 | `cordis.patch.yml` |
 | 客户端运行格式 | `window.__ModuleLoader__.load({ id, factory })` |
 | 主要依赖 | `react`；可选 `react-dom` |
 | 样式 | 内嵌在 `client.js` 的 CSS 模板字符串中 |
 | 数据持久化 | 浏览器 `localStorage` |
-| 网络请求 | 无 |
-| 后台轮询 | 无 |
+| 网络请求 | 手动检查/更新，或每日自动更新检查（24h 节流） |
+| 后台轮询 | 无网络轮询；每小时本地 tick 判断是否到期 |
 | License | AGPL-3.0 |
 
-`client.js` 约 3.3k 行、约 140 KB，单文件包含：
+`client.js` 约 4k 行、约 140 KB，单文件包含：
 
 - 常量与国际化字典
 - 设置存储与迁移
 - 图标、吉祥物、设置页、提醒卡片
-- 会话状态订阅、队列、声音
+- 会话状态订阅、队列、声音、DSH 内 / Windows 通知中心 / 悬浮窗切换
 - 全部 CSS
 
 没有 `src/`、没有打包器、没有生成步骤。修改 `client.js` 就是修改产物。
@@ -70,9 +70,12 @@
 │  · api-session/error 事件                                   │
 │  · remote.session（打开工作区）                              │
 │  · remote.pluginManager（卸载）                              │
+│  · webServer / connection → /completed-ding/update       │
+│  · /completed-ding/foreground → Win32 前台全屏检测        │
+│  · Gitee API（仅检查/应用更新时）                             │
 │  · uiWorkspace（跳转会话，客户端服务）                        │
 └───────────────────────────┬────────────────────────────────┘
-                            │ Cordis / Remote / Slots
+                            │ Cordis / Remote / Slots / 同源 HTTP
 ┌───────────────────────────▼────────────────────────────────┐
 │ Client bundle: dsh-completed-ding                          │
 │                                                            │
@@ -91,24 +94,30 @@
 │   ├─ completion / error / pendingInteraction detection      │
 │   ├─ queue state machine                                    │
 │   └─ ReactDOM.createPortal(card, body-level host)           │
+│   ├─ desktop mode: Web Notification → OS                    │
+│   └─ floating mode: Document PiP → always-on-top window     │
+│                                                            │
+│  SettingsPage                                               │
+│   ├─ 配置 / 预览 / 卸载                                     │
+│   └─ 版本与更新 → POST /completed-ding/update            │
 └────────────────────────────────────────────────────────────┘
 ```
 
-### Host half 为什么是空的
+### Host half 负责更新与前台检测
 
-`index.js` 只有：
+`index.js` 注册两个同源、已认证路由：
 
-```js
-export function apply() {}
-```
+- `POST /completed-ding/update`：
+  - `check`：读取 Gitee `master` 的 `package.json` 并比较版本。
+  - `apply`：按最新 `package.json` 的 `files` 拉取运行文件，校验
+    `client.js` / `index.js` / `cordis.patch.yml`，然后替换插件目录中的文件。
+  - 写入失败时回滚已替换的文件；`client.js` 最后写入，避免 HMR 在资源尚未
+    落盘时提前重载。
+- `GET /completed-ding/foreground`：Windows 前台窗口全屏检测，供 Windows 通知
+  全屏静音使用。
 
-原因：
-
-- 会话完成/失败/待回答的判定全部依赖客户端的会话状态投影。
-- 插件不需要 Host 侧定时器、存储或后台任务。
-- 空 Host 让插件在没有提醒时几乎零成本，也让安装/卸载更干净。
-
-> 如果未来加入“系统通知”“跨设备同步”这类能力，才需要 Host 半边；不要在客户端偷偷加轮询来替代。
+没有 `webServer` 时直接返回，不影响提醒功能。Host 仍然没有定时器、轮询或常驻
+网络任务；Gitee 请求由客户端的每日检查或设置页手动检查触发。
 
 ---
 
@@ -533,6 +542,77 @@ visible ── auto close / close button / replace ──► leaving
 - `scheduleCue` 先清掉旧 timer，再在 90ms 后播放当前设置的声音，避免同一批状态更新连续响多次。
 - 关闭提醒不停止已经播放的声音；再次播放会先 `stopSound()` 停掉上一条。
 
+短音预设：
+
+- `CHIME_KINDS = ['chime', 'chime-bright', 'chime-soft', 'chime-wood', 'chime-drop', 'chime-dingdong']`。
+- `CHIME_PRESETS` 保存每个预设的 wave、频率序列、delay、gain、滤波和衰减；`chime` 保持原默认波形参数不变。
+- `playChime(volume, kind)` 按预设合成；`playConfiguredSound` 对短音传入 `soundKind`。
+- 设置页「短音」按钮点击后执行 `applyShortSound(kind)`：保存 `soundKind`、强制打开声音，并立即试听。
+
+### 5.6 通知位置、Windows 通知中心与悬浮窗
+
+`enqueue(next)` 先看 `settings.deliveryMode`：
+
+- `auto`（默认）→ 用 `dshIsForeground()`（`document.visibilityState` + `document.hasFocus()`）判断：
+  - 前台 → `inApp` 卡片；
+  - 后台/最小化/托盘且悬浮窗已打开 → `floating`，Portal 到 PiP；
+  - 后台且没有可用悬浮窗 → `desktop`；
+  - `desktop` 也不可用 → 回退到 `inApp`。
+- `inApp` → 走 5.4 的卡片队列。
+- `desktop` → 走 `enqueueDesktop(next)`，使用浏览器 Web Notifications：
+
+```js
+new Notification(title, {
+  body,
+  icon: document.querySelector('link[rel="icon"]')?.href,
+  silent: true,
+  tag: 'dsh-completed-ding',
+  requireInteraction: false,
+})
+```
+
+桌面队列 `desktopMachine.current`：
+
+```js
+{ active, notice, pending, hideTimer, gapTimer }
+```
+
+- 同一时间只保留一条系统通知；新提醒会关闭上一条，等待配置的 gap（至少 180ms）后显示下一条。
+- `pending` 只保留最新一条，避免系统通知中心堆积。
+- `hideTimer` 按 `durationSeconds` 主动 `close()`；但系统仍可能提前/延后自动隐藏。
+- `silent: true`：系统通知不播放系统音，声音仍走 5.5 的插件声音设置，避免双响。
+- 点击系统通知：关闭通知，尝试 `window.focus()`，并在 `uiWorkspace.openSession` 可用时打开对应会话。
+- 权限：设置页切换时调用 `Notification.requestPermission()`；拒绝、未知或没有 `Notification` 构造器时，`enqueue` 自动回退到 DSH 内卡片。
+- 切换回 `inApp` 或关闭总开关时，`clearDesktopQueue()` 关闭活动通知并清空 pending/timer。
+- Windows 通知的标题/正文复用提醒数据：完成/失败标题、任务名、错误摘要、工作区、问题/计划/授权内容。样式、位置和停留行为由操作系统决定。
+- `suppressWindowsFullscreen` 默认 `true`：显示 Windows 通知前请求 `GET /completed-ding/foreground`；Host 用 Windows `GetForegroundWindow` + 窗口矩形与监视器 `rcMonitor` 比较，判断其他应用是否全屏。全屏时跳过通知，但 `scheduleCue` 仍播放声音。
+- 前台检测缓存 1.2s；非 Windows 或 PowerShell/检测失败返回 `false`（按允许弹出处理），避免误吞提醒。
+- 检测是 Best-effort：无边框全屏、游戏覆盖层、特殊多屏布局可能识别不到。
+
+### 5.7 桌面悬浮窗
+
+`deliveryMode: 'floating'` 时：
+
+```js
+documentPictureInPicture.requestWindow({
+  width: 440,
+  height: 260,
+  disallowReturnToOpener: true,
+  preferInitialWindowPlacement: true,
+})
+```
+
+实现：
+
+- `openFloatingWindow()` 必须在用户手势（设置页点击）中调用；返回的 PiP 窗口默认置顶。
+- 把 `CSS + FLOATING_CSS` 注入 PiP document；`floatingState.host` 作为 React Portal 容器。
+- 没有提醒时渲染 `dcd-floating-idle-card` 待机卡；有提醒时复用正常 `.dcd-toast` 卡片。
+- 仍然是单卡片队列，40 秒自动关闭，关闭后回到待机卡。
+- 窗口被用户关闭时触发 `pagehide`：清空 host，若当前模式仍是 `floating` 则自动切回 `inApp`。
+- 从悬浮窗切到其他模式时，`closeFloatingWindow(false)` 主动关闭；组件卸载时 `closeFloatingWindow(true)`。
+- 不支持 `documentPictureInPicture` 时设置页提示，提醒回退到 DSH 内卡片。
+- 悬浮窗的位置、窗口边框和关闭按钮由浏览器 PiP 实现控制，不是插件自绘的置顶层。
+
 ---
 
 ## 6. UI 组件
@@ -664,10 +744,13 @@ return portalHost && ReactDOM?.createPortal
 3. 总开关卡片。
 4. 操作行：预览提醒 / 预览失败 / 预览待回答 / 试听 / 恢复默认。
 5. 提醒内容卡片。
-6. 声音与提醒卡片。
+6. 声音与提醒卡片：通知位置、声音开关/来源、音量、时长、间隔。
 7. 提醒范围卡片。
-8. 备注。
-9. 卸载确认 modal（条件渲染）。
+8. 版本与更新卡片：当前版本、每日自动更新模式、检查、确认、更新、刷新、Gitee 链接。
+9. 关于卡片：标题「关于」、软件全称 **DSH会话完成提醒**、版本、AGPL-3.0、Gitee 仓库入口。
+10. 右上角更新提示卡（`UpdatePrompt`，由 shell.overlay 单独注册）。
+11. 备注。
+12. 卸载确认 modal（条件渲染）。
 
 设置控件：
 
@@ -675,6 +758,19 @@ return portalHost && ReactDOM?.createPortal
 - `RangeControl`
 - `SettingRow`
 - `SettingCard`
+
+更新卡片的客户端状态机：
+
+```text
+idle → checking → latest | available | error
+available → confirm → updating → done | restart | error
+latest/error → checking
+```
+
+- `check` 只读取版本，不写文件。
+- `apply` 由用户二次确认后触发，替换运行文件。
+- `done` 后 1.6s 自动 `location.reload()`；HMR 已经重载时计时器会随旧组件卸载。
+- 服务端失败统一展示 `update.error`；网络类错误展示更友好的离线提示。
 
 卸载 modal：
 
@@ -917,13 +1013,16 @@ const LIMITS = Object.freeze({
 
 ### 9.2 内置语音
 
-`BUILTIN_VOICE_DATA_URL` 是一个 `data:audio/mpeg;base64,...` 常量，对应 `sounds/完成的语音.mp3`。
+两个 `data:audio/mpeg;base64,...` 常量：
+
+- `BUILTIN_VOICE_DATA_URL` → `sounds/您的任务完成啦，请查看（可爱）.mp3`
+- `BUILTIN_VOICE_ELEGANT_DATA_URL` → `sounds/您的任务已完成，请查看（知性）.mp3`
 
 注意：
 
 - 运行时播放的是 `client.js` 里内嵌的副本。
-- 只替换 `sounds/完成的语音.mp3` 不会改变运行时声音；必须同时更新内嵌常量（或改为 Host 资源加载）。
-- 选择 `soundKind: 'voice'` 时用普通 `Audio` 播放。
+- 只替换音频文件不会改变运行时声音；必须同时更新对应内嵌常量（或改为 Host 资源加载）。
+- `soundKind: 'voice'` 播放可爱语音，`soundKind: 'voice-elegant'` 播放知性语音，均用普通 `Audio` 播放。
 
 ### 9.3 自定义音频
 
@@ -948,11 +1047,13 @@ playConfiguredSound(current, force = false) {
   if (current.volume <= 0) return;
   stopSound();
   if (current.soundKind === 'voice' && playAudioSource(BUILTIN_VOICE_DATA_URL, current.volume)) return;
+  if (current.soundKind === 'voice-elegant'
+    && playAudioSource(BUILTIN_VOICE_ELEGANT_DATA_URL, current.volume)) return;
   if (current.soundKind === 'custom') {
     const custom = getCustomSound();
     if (custom && playAudioSource(custom.dataUrl, current.volume)) return;
   }
-  playChime(current.volume);
+  playChime(current.volume, current.soundKind);
 }
 ```
 
@@ -1019,6 +1120,69 @@ runtime.remote.pluginManager.removeBundle('dsh-completed-ding')
 
 不要直接删 `node_modules` 或改 profile 文件来“模拟卸载”；那会绕过插件管理器的锁、pnpm 状态和热重载。
 
+### 10.4 检查更新与热更新
+
+入口：设置页「版本与更新」卡片。
+
+```text
+POST /completed-ding/update
+{ "action": "check" }
+{ "action": "apply", "version": "1.5.4" }
+```
+
+Host 半边：
+
+1. `check` 读取 Gitee 仓库默认分支的 `package.json`，返回
+   `currentVersion` / `latestVersion` / `available` / `repoUrl`。
+2. `apply` 重新读取最新版本，确认版本没有被仓库移动。
+3. 按最新 `package.json.files` 收集运行文件：
+   `package.json`、`index.js`、`client.js`、`cordis.patch.yml`、`locale/*.json`、
+   `icon.svg`、`sounds/*.mp3`。
+4. 校验包名、`client.js` 语法、Host 入口和 bundle 名称。
+5. 逐文件比较；只写有变化的文件，`client.js` 最后写入。写入失败按备份回滚。
+6. 返回 `applied` / `files` / `restartRequired`。
+
+安全与边界：
+
+- 路由是 exact POST，优先调用 `connection.requestRejection`；没有 Connection
+  服务时只允许 loopback。
+- `safeTarget` 拒绝 `..` 和越界绝对路径。
+- 单文件上限 5 MB，总量上限 25 MB，请求体上限 4 KB。
+- 写入根目录来自 `import.meta.url` 的 `dirname`，即插件自身安装目录。
+- `restartRequired` 在当前 `index.js` 也发生变化时为 true；提醒客户端更新通常只
+  需要 HMR，不需要重启。
+
+客户端：
+
+- `PLUGIN_VERSION` 必须和 `package.json.version` 一致。
+- `checking → latest/available/error`、`available → confirm → updating → done/restart/error`
+  状态机；
+- `done` 后 1.6 秒刷新页面；`restart` 留给用户重启 DSH。
+- 手动检查只在点击按钮时请求；自动检查见 10.5。
+
+### 10.5 每日自动更新
+
+`autoUpdateMode`：
+
+- `off`（默认）：不自动检查；`startAutoUpdate` 的 tick 会直接返回，不访问 Gitee。
+- `prompt`：每天检查，发现新版本后 `setUpdatePrompt({visible:true,status:'available'})`；DSH 右上角卡片显示「立即更新」，Windows 通知只提示。
+- `install`：每天检查后直接调用 `applyAutoUpdate(version)`，自动下载、校验、替换；失败或需要重启时在卡片/提示中说明。
+
+调度：
+
+- `startAutoUpdate()` 在 `apply()` 生命周期内启动，每小时 tick 一次。
+- `readLastUpdateCheck()` / `writeLastUpdateCheck()` 用 localStorage 做 24 小时节流。
+- 检查失败不写时间戳，下个 tick 重试；成功检查才写。
+- 设置切换 `autoUpdateMode` 时触发一次检查；已有 24h 时间戳则不会重复请求。
+- 自动检查/更新仍走 `POST /completed-ding/update`，复用 Host 的校验、写入顺序和回滚。
+
+提示：
+
+- `updatePromptState` + `useUpdatePrompt()` 是模块级 store；`UpdatePrompt` 注册在
+  `shell.overlay`（id `completed-ding.update`，order 81），右上角显示。
+- Windows 通知的更新提示只包含标题/正文；点击只聚焦 DSH，不直接执行更新。
+- 全屏静音开关同样作用于更新提示：其他应用全屏时跳过 Windows 更新通知。
+
 ---
 
 ## 11. 代码地图
@@ -1027,20 +1191,26 @@ runtime.remote.pluginManager.removeBundle('dsh-completed-ding')
 
 | 区块 | 关键符号 | 职责 |
 | --- | --- | --- |
-| 常量 | `NS`, `SETTINGS_KEY`, `LIMITS`, `DEFAULT_SETTINGS` | 标识、存储、限制、默认值 |
+| 常量 | `NS`, `PLUGIN_VERSION`, `UPDATE_ROUTE`, `SETTINGS_KEY`, `LIMITS`, `DEFAULT_SETTINGS` | 标识、版本、更新路由、存储、限制、默认值 |
 | 国际化 | `zh`, `en` | 文案；两套必须同步 |
 | 设置 | `normalizeSettings`, `readStoredSettings`, `saveSettings`, `useSettings` | 读取/迁移/持久化/订阅 |
-| 音频 | `ensureAudioContext`, `playChime`, `playAudioSource`, `playConfiguredSound` | 声音 |
+| 音频 | `ensureAudioContext`, `playChime`, `CHIME_PRESETS`, `playAudioSource`, `playConfiguredSound`, `applyShortSound` | 短音预设、语音/自定义音频 |
+| Windows 通知中心 | `desktopPermissionGranted`, `enqueueDesktop`, `showDesktop`, `closeDesktop` | 系统通知、权限、队列、回退 |
+| 自动选择 | `dshIsForeground`, `deliverWindows`, `windowsForegroundFullscreen` | 前台/后台路由、全屏静音 |
+| 每日自动更新 | `startAutoUpdate`, `checkDailyUpdate`, `applyAutoUpdate`, `updatePromptState`, `UpdatePrompt` | 24h 检查、提示/自动安装、更新卡片 |
+| Host 全屏检测 | `foregroundFullscreen`（index.js） | Win32 前台窗口矩形检测、缓存 |
+| 悬浮窗 | `openFloatingWindow`, `closeFloatingWindow`, `floatingState` | Document PiP 置顶窗口、Portal、生命周期 |
 | 图标 | `CheckIcon` … `TrashIcon`, `PanelIcon` | SVG |
 | 吉祥物 | `JellyMascot` | 表情、眼睛跟随 |
 | 文本 | `truncate`, `classifyFailure`, `summarizeError`, `basename` | 纯函数 |
 | 工作区 | `resolveWorkspace` | 会话 → 工作区 |
 | 提醒模型 | `makeNotice`, `waitingFacts`, `makeWaitingNotice` | 构造 notice |
-| 设置页 | `SettingsPage` | 表单、预览、卸载 modal |
+| 设置页 | `SettingsPage` | 表单、预览、更新卡片、卸载 modal |
 | 提醒层 | `ToastLayer` | 状态订阅、队列、渲染、Portal |
 | CSS | `CSS` 模板字符串 | 全部样式 |
 | 样式注入 | `insertStyles` | 去重插入 |
 | 注册 | `inject`, `apply` | 服务、slot、生命周期 |
+| Host 更新 | `checkForUpdate`, `applyUpdate`, `downloadRuntimeFiles`, `safeTarget` | Gitee 检查、校验、热更新 |
 
 `ToastLayer` 内部关键闭包：
 
@@ -1188,7 +1358,15 @@ runtime.remote.pluginManager.removeBundle('dsh-completed-ding')
 
 ### 安全
 
-- 不发起网络请求，不收集遥测。
+- 日常提醒不发起网络请求，不收集遥测。
+- 只有点击「检查更新」、确认更新，或每日自动更新检查到期时，Host 才访问 Gitee 公开仓库；不上传设置、
+  会话内容或自定义音频。
+- 更新路由要求同源、已认证请求：优先走 `connection.requestRejection`，没有
+  Connection 服务时只接受 loopback。
+- 全屏检测路由同样要求认证；只调用固定 PowerShell 脚本读取前台窗口矩形和监视器范围，不读取窗口内容或标题。
+- 更新只写插件自己的运行文件，拒绝 `..` 路径；先校验 `client.js` 语法、Host
+  入口和 bundle 名称，写入失败会回滚。
+- 更新来源是 Gitee `master`；只有信任该仓库时才确认更新。
 - 不读取凭据、不写会话日志。
 - 问题文本/错误文本作为纯文本渲染（React 转义），不注入 HTML。
 - 自定义音频只读取用户选择的文件，限制 2 MB，存为 Data URL。
@@ -1200,39 +1378,54 @@ runtime.remote.pluginManager.removeBundle('dsh-completed-ding')
 ## 15. 兼容性与已知限制
 
 - **DSH 版本耦合：** 依赖 `shell.overlay`、`main`、`sidebar.panellist`、`sessions`、`workspaces`、`useSessionStatus`。DSH 大版本升级后需要回归。
-- **页面内通知：** 不调用系统通知中心；窗口最小化时看不到卡片。
+- **三种通知位置：** 默认是 DSH 内卡片；切到 Windows 通知中心后由系统绘制；切到悬浮窗后使用 Document Picture-in-Picture 的置顶窗口。
+- **桌面能力受环境限制：** 浏览器/Electron 拒绝通知权限、系统关闭通知、或没有 Document Picture-in-Picture 时会回退到 DSH 内卡片。
+- **悬浮窗需要用户手势：** 首次打开和关闭后重新打开都必须由用户点击，不能在没有手势时自动创建；刷新页面后也不会自动恢复。
+- **自动更新会联网：** 默认关闭；开启后每天最多检查一次，`install` 模式会直接替换运行文件，只有信任 Gitee 仓库时才应开启。检查失败不写时间戳，下个小时会重试。
+- **全屏检测是 Best-effort：** 依赖 Windows 前台窗口矩形与监视器 `rcMonitor` 比较；无边框全屏、游戏覆盖层、多屏特殊布局可能漏判，非 Windows/检测失败时按允许弹出处理。
+- **DSH Desktop 可能没有 Document PiP：** Electron 宿主未暴露 `documentPictureInPicture` 时，设置页把悬浮窗选项标为当前环境不支持并回退到 DSH 内卡片；这不是异常，系统通知仍然可用。
+- **悬浮窗 portal 是实验性的：** 卡片通过 React Portal 渲染到 PiP document；关闭/打开/定位由 PiP 实现控制，个别宿主可能限制任意 HTML。
 - **单浏览器设置：** 设置/自定义音频不跨浏览器、不跨设备同步。
 - **单卡片队列：** 不支持堆叠，最新的 pending 覆盖旧的。
 - **待回答依赖宿主投影：** 宿主不暴露 `pendingInteraction` 时无法提醒。
 - **自定义音频 2 MB：** 受 localStorage 配额限制。
 - **卸载需要管理器：** 没有 `remote.pluginManager` 时只能退化为打开插件页/手动卸载。
-- **无构建工具链：** 所有代码在一个文件里，长期扩展时要注意模块化边界。
-- **日期版本号：** Git 提交是 `10.31-x` 形式，`package.json` 的 `1.0.0` 不自动同步。
+- **热更新需要 Web 宿主：** 没有 `webServer` / `connection` 时提醒照常，但「检查更新」不可用。
+- **更新写权限：** 插件安装目录必须可写；只读包或受保护目录会提示失败，可回到插件管理器手动更新。
+- **首次启用更新路由可能需要重启：** 1.1.0 新增 Host 路由；如果当前进程没有热加载 Host 文件，重启一次 DSH 后再使用按钮。
+- **Git 安装的更新会被重新安装覆盖：** 热更新写入当前安装目录；之后如果从插件管理器重装，以仓库/包管理器为准。
+- **无构建工具链：** `client.js` 仍是单文件产物，长期扩展时要注意模块化边界。
+- **版本号：** 从 1.1.0 起 `package.json`、`PLUGIN_VERSION`、版本徽章和更新记录保持同步。
 
 ---
 
 ## 16. 发布流程
 
-1. 修改 `client.js` / 文档。
-2. 跑 `node --check client.js`。
+1. 修改 `client.js` / `index.js` / 文档。
+2. 跑 `node --check client.js` 和 `node --check index.js`。
 3. 回归[测试清单](#17-测试清单)。
-4. 更新 `docs/README.md` 的更新记录。
-5. 如果改了截图，更新 `docs/assets/`。
-6. 更新 `package.json` 的 `description`（如需要）。
-7. commit，提交信息沿用日期版本风格，例如：
+4. 更新 `package.json` 的 `version`；同步 `client.js` 的 `PLUGIN_VERSION`、
+   `docs/assets/badge-version.svg`。
+5. 更新 `docs/README.md` 的更新记录。
+6. 如果改了截图，更新 `docs/assets/`。
+7. 更新 `package.json` 的 `description`（如需要）。
+8. commit，提交信息沿用日期版本风格，例如：
 
    ```text
-   10.31-8优化功能
+   11.02-1增加检查更新
    ```
 
-8. push 到 Gitee。
-9. 在 DSH 插件页卸载旧版/重新安装，或对本地 `link` 安装直接刷新验证。
-10. 确认安装后的 `client.js` 与仓库一致。
+9. push 到 Gitee。
+10. 在 1.1.0 之前的版本上手动安装一次；之后可用设置页「检查更新」验证完整
+    的检查 → 确认 → 热更新流程。
+11. 确认 `check` 返回的版本、`apply` 后的文件、刷新后的 `PLUGIN_VERSION` 一致。
 
 ### 版本号约定
 
-- Git 提交：日期序号（`10.31-7`），用于追加变更。
-- `package.json`：`1.0.0`，包语义版本；大改再考虑 bump。
+- Git 提交：日期序号（`11.02-1`），用于追加变更。
+- `package.json`：包语义版本，当前 `1.5.4`；功能或更新机制变化时 bump。
+- `client.js` 的 `PLUGIN_VERSION` 必须与 `package.json` 一致，否则设置页显示和
+  更新比较会错位。
 - `docs/README.md` 的更新记录是用户能读懂的权威变更摘要。
 
 ---
@@ -1250,10 +1443,26 @@ runtime.remote.pluginManager.removeBundle('dsh-completed-ding')
 - [ ] 连续多个提醒：不堆叠，间隔约 200ms。
 - [ ] 浅色/深色主题：文字、按钮、边框都可读。
 - [ ] 窄屏（约 520px）与矮屏：不溢出，按钮可点。
-- [ ] 三种声音：合成音、内置语音、自定义音频。
+- [ ] 六种短音：轻提示音、清脆三音、柔和低音、木质轻敲、水滴声、叮咚；点一下即试听并应用。
+- [ ] 内置语音与自定义音频：选择、试听、刷新后保留。
+- [ ] 通知位置默认是自动选择；切换 Windows 通知中心会请求权限。
+- [ ] 自动选择：DSH 前台用卡片；切到后台用 Windows；悬浮窗打开后后台优先悬浮窗。
+- [ ] 全屏静音：其他应用全屏时不弹 Windows 通知，但仍播放声音；关闭开关后恢复。
+- [ ] Windows 通知中心出现在 DSH 窗口外；拒绝权限时回退到 DSH 内。
+- [ ] Windows 通知一次只留一条，新提醒关闭上一条后再来。
+- [ ] 点击 Windows 通知能聚焦 DSH 并打开对应会话（可用时）。
+- [ ] 悬浮窗：设置页点开后显示待机卡；提醒复用同一张卡片；关闭窗口回退到 DSH 内。
+- [ ] 悬浮窗不支持时给出提示，不阻断提醒。
+- [ ] 自动更新提示：24h 内不重复检查；发现新版本出右上角卡片；Windows 只提示。
+- [ ] 自动更新安装：发现新版本自动替换并刷新；失败/需要重启时有提示。
+- [ ] 切换自动更新模式后按 24h 节流检查，不重复打 Gitee。
 - [ ] 静音/音量 0/总开关关闭：不播放。
 - [ ] 自定义音频超 2MB / 非音频：有错误提示。
 - [ ] 刷新后：设置保留；旧 20 秒迁移正确；pending 问题重新提醒。
+- [ ] 检查更新：同源 POST 可用；未登录/跨源被拒绝。
+- [ ] 最新版本：显示已是最新，不写文件。
+- [ ] 有更新：确认后只替换运行文件，`client.js` 最后写入，页面可刷新。
+- [ ] 更新失败：`client.js` 保持原样或回滚，设置不丢。
 - [ ] 卸载：确认框、成功/重启/失败路径。
 - [ ] 减少动态效果：动画和眼睛跟随关闭。
 - [ ] 窗口缩放/侧栏开关：仍贴右下角。
