@@ -3,13 +3,15 @@
  *
  * The reminder itself lives entirely in the browser. This half adds one
  * authenticated, same-origin update route: it reads the public Gitee repository
- * and can replace the plugin's runtime files without uninstalling it.
+ * and can replace the plugin's runtime files without uninstalling it. A second
+ * route clears the leftovers an earlier install or uninstall can leave behind,
+ * right before the plugin manager removes the package.
  *
- * The route is intentionally quiet until the user presses "check for updates".
+ * The routes are intentionally quiet until the user asks for them.
  */
-import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
+import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { mkdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { lstat, mkdir, readFile, readdir, realpath, rm, rmdir, writeFile } from 'node:fs/promises';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 
@@ -21,6 +23,7 @@ const GITEE_BRANCH = 'master';
 const GITEE_REPO_URL = 'https://gitee.com/user_gitee/dsh-completed-ding.git';
 const ROUTE_PATH = '/completed-ding/update';
 const FOREGROUND_PATH = '/completed-ding/foreground';
+const UNINSTALL_PATH = '/completed-ding/uninstall';
 const PACKAGE_ROOT = dirname(fileURLToPath(import.meta.url));
 const MAX_FILE_BYTES = 5 * 1024 * 1024;
 const MAX_TOTAL_BYTES = 25 * 1024 * 1024;
@@ -28,6 +31,12 @@ const REQUEST_LIMIT_BYTES = 4 * 1024;
 const FETCH_TIMEOUT_MS = 20_000;
 const FULLSCREEN_TIMEOUT_MS = 1_500;
 const FULLSCREEN_CACHE_MS = 1_200;
+/* Anonymous Gitee API calls are capped at roughly 60 per hour per IP, so file
+ * bodies come from the raw endpoint and directory listings are cached. */
+const RAW_BASE = `https://gitee.com/${GITEE_OWNER}/${GITEE_REPO}/raw`;
+const RATE_LIMIT_HINT = 'Gitee 接口限流（403）：未登录调用每小时约 60 次，请约一小时后再试；频繁点「更新」也会触发。';
+const DIRECTORY_CACHE_MS = 5 * 60 * 1000;
+const directoryCache = new Map();
 
 function apiUrl(path) {
   return `https://gitee.com/api/v5/repos/${GITEE_OWNER}/${GITEE_REPO}${path}`;
@@ -39,6 +48,42 @@ function encodeContentPath(path) {
 
 function messageOf(error) {
   return error instanceof Error ? error.message : String(error);
+}
+
+/** One Gitee failure, in words the settings page can show as-is. */
+function giteeFailure(status, detail) {
+  const limited = status === 429 || (status === 403 && /rate\s*limit/i.test(detail));
+  const error = new Error(limited
+    ? RATE_LIMIT_HINT
+    : `Gitee ${status}${detail ? `: ${detail}` : ''}`);
+  error.status = status;
+  error.rateLimited = limited;
+  return error;
+}
+
+/** Read one file from the raw endpoint: it does not spend the API quota. */
+async function readRaw(branch, path) {
+  const url = `${RAW_BASE}/${encodeURIComponent(branch)}/${encodeContentPath(path)}`;
+  const response = await fetch(url, {
+    headers: { 'user-agent': 'dsh-completed-ding-updater' },
+    signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
+    redirect: 'follow',
+  });
+  if (!response.ok) {
+    const detail = (await response.text().catch(() => '')).slice(0, 200);
+    throw giteeFailure(response.status, detail);
+  }
+  return Buffer.from(await response.arrayBuffer());
+}
+
+/** One directory listing, cached for a few minutes to spare the API quota. */
+async function listDirectory(branch, directory) {
+  const key = `${branch}:${directory}`;
+  const cached = directoryCache.get(key);
+  if (cached !== undefined && Date.now() - cached.at < DIRECTORY_CACHE_MS) return cached.entries;
+  const entries = await gitee(`/contents/${encodeContentPath(directory)}?ref=${encodeURIComponent(branch)}`);
+  if (Array.isArray(entries)) directoryCache.set(key, { at: Date.now(), entries });
+  return entries;
 }
 
 const FULLSCREEN_SCRIPT = `
@@ -129,20 +174,10 @@ async function gitee(path, signal) {
     signal: signal || AbortSignal.timeout(FETCH_TIMEOUT_MS),
   });
   if (!response.ok) {
-    const detail = (await response.text()).slice(0, 300);
-    throw new Error(`Gitee ${response.status}${detail ? `: ${detail}` : ''}`);
+    const detail = (await response.text().catch(() => '')).slice(0, 300);
+    throw giteeFailure(response.status, detail);
   }
   return response.json();
-}
-
-function decodeEntry(entry) {
-  if (!entry || entry.type !== 'file' || typeof entry.content !== 'string') {
-    throw new Error('Gitee returned a non-file entry');
-  }
-  if (entry.encoding === 'utf-8' || entry.encoding === 'utf8') {
-    return Buffer.from(entry.content, 'utf8');
-  }
-  return Buffer.from(entry.content.replace(/\s+/g, ''), 'base64');
 }
 
 async function readLocalPackage() {
@@ -151,12 +186,19 @@ async function readLocalPackage() {
 }
 
 async function fetchLatestPackage() {
-  const repository = await gitee('');
-  const branch = typeof repository.default_branch === 'string' && repository.default_branch
-    ? repository.default_branch
-    : GITEE_BRANCH;
-  const entry = await gitee(`/contents/package.json?ref=${encodeURIComponent(branch)}`);
-  const raw = decodeEntry(entry);
+  let branch = GITEE_BRANCH;
+  let raw;
+  try {
+    raw = await readRaw(branch, 'package.json');
+  } catch (error) {
+    /* Only a renamed default branch justifies asking the API for its name. */
+    if (error.status !== 404) throw error;
+    const repository = await gitee('');
+    if (typeof repository.default_branch === 'string' && repository.default_branch) {
+      branch = repository.default_branch;
+    }
+    raw = await readRaw(branch, 'package.json');
+  }
   const latest = JSON.parse(raw.toString('utf8'));
   if (latest.name !== PACKAGE_NAME) {
     throw new Error(`the Gitee package is "${String(latest.name)}", not ${PACKAGE_NAME}`);
@@ -165,7 +207,6 @@ async function fetchLatestPackage() {
     throw new Error('the Gitee package has no version');
   }
   return {
-    repository,
     branch,
     packageJson: latest,
     raw,
@@ -192,9 +233,7 @@ async function collectRuntimeFiles(latest, branch) {
     if (slash >= 0 && pattern.slice(slash + 1).includes('*')) {
       const directory = pattern.slice(0, slash);
       const namePattern = pattern.slice(slash + 1);
-      const entries = await gitee(
-        `/contents/${encodeContentPath(directory)}?ref=${encodeURIComponent(branch)}`,
-      );
+      const entries = await listDirectory(branch, directory);
       if (!Array.isArray(entries)) continue;
       const matcher = globToRegExp(namePattern);
       for (const entry of entries) {
@@ -214,10 +253,7 @@ async function downloadRuntimeFiles(latest, branch) {
   const payload = new Map();
   let total = 0;
   for (const path of paths) {
-    const entry = await gitee(
-      `/contents/${encodeContentPath(path)}?ref=${encodeURIComponent(branch)}`,
-    );
-    const bytes = decodeEntry(entry);
+    const bytes = await readRaw(branch, path);
     if (bytes.length > MAX_FILE_BYTES) {
       throw new Error(`${path} is larger than the 5 MB update limit`);
     }
@@ -308,8 +344,8 @@ async function checkForUpdate() {
     latestVersion: latest.packageJson.version,
     available: compareVersions(latest.packageJson.version, local.version) > 0,
     branch: latest.branch,
-    pushedAt: latest.repository.pushed_at,
-    repoUrl: latest.repository.html_url || GITEE_REPO_URL,
+    pushedAt: null,
+    repoUrl: GITEE_REPO_URL,
   };
 }
 
@@ -380,6 +416,107 @@ async function applyUpdate(requestedVersion) {
     restartRequired: indexChanged,
   };
 }
+
+/** pnpm's temporary directory for a package it is importing, e.g. dsh-completed-ding_tmp_7244_3. */
+const TEMPORARY_DIRECTORY = new RegExp(`^${PACKAGE_NAME}_tmp_\\d+_\\d+$`);
+
+/**
+ * The profile directory this plugin was installed into. The Host knows it
+ * through `profileContext`; the package location answers for hosts without it.
+ * @param ctx - the Host plugin context.
+ * @returns the profile directory, or null when it cannot be told.
+ */
+function profileDirectory(ctx) {
+  try {
+    const profile = ctx.get('profileContext');
+    if (profile && typeof profile.dir === 'string' && profile.dir !== '') return profile.dir;
+  } catch {
+    /* The service is optional outside profile-managed hosts. */
+  }
+  const parent = dirname(PACKAGE_ROOT);
+  return basename(parent) === 'node_modules' ? dirname(parent) : null;
+}
+
+async function realPath(path) {
+  try {
+    return await realpath(path);
+  } catch {
+    return null;
+  }
+}
+
+async function sameDirectory(left, right) {
+  const [a, b] = await Promise.all([realPath(left), realPath(right)]);
+  return a !== null && b !== null && a.toLowerCase() === b.toLowerCase();
+}
+
+/** Whether a directory holds this package, so a cleanup never deletes a stranger. */
+async function declaresPackage(directory) {
+  try {
+    const manifest = JSON.parse(await readFile(join(directory, 'package.json'), 'utf8'));
+    return manifest !== null && typeof manifest === 'object' && manifest.name === PACKAGE_NAME;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Remove what an interrupted install or uninstall leaves in the profile's
+ * node_modules: the directory link a local-path install creates, and pnpm's
+ * temporary directories. Either one makes the next install fail with EPERM on
+ * Windows, because pnpm cannot move a package into a name that already exists.
+ * The package the Host is running from is left to the plugin manager's own
+ * `pnpm remove`, so a failed removal cannot leave the profile half-uninstalled.
+ * @param profileDir - the profile directory the plugin lives in.
+ * @returns the entries removed, and those deliberately kept with the reason.
+ */
+async function cleanUninstallLeftovers(profileDir) {
+  const nodeModules = join(profileDir, 'node_modules');
+  const removed = [];
+  const kept = [];
+  const attempt = async (target, remove) => {
+    try {
+      await remove();
+      removed.push(relative(profileDir, target));
+    } catch (error) {
+      kept.push({ path: relative(profileDir, target), reason: messageOf(error) });
+    }
+  };
+
+  const packageDir = join(nodeModules, PACKAGE_NAME);
+  const entry = await lstat(packageDir).catch(() => null);
+  if (entry !== null) {
+    if (entry.isSymbolicLink()) {
+      /* A junction or symlink from a local-path install; remove the link, never its target. */
+      await attempt(packageDir, () => rmdir(packageDir));
+    } else if (entry.isDirectory()) {
+      if (await sameDirectory(packageDir, PACKAGE_ROOT)) {
+        kept.push({
+          path: relative(profileDir, packageDir),
+          reason: 'the running package is removed by the plugin manager',
+        });
+      } else if (await declaresPackage(packageDir)) {
+        await attempt(packageDir, () => rm(packageDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 120 }));
+      } else {
+        kept.push({ path: relative(profileDir, packageDir), reason: 'not a dsh-completed-ding package' });
+      }
+    }
+  }
+
+  for (const directory of [nodeModules, join(nodeModules, '.ignored')]) {
+    const entries = await readdir(directory, { withFileTypes: true }).catch(() => []);
+    for (const item of entries) {
+      if (!TEMPORARY_DIRECTORY.test(item.name)) continue;
+      const target = join(directory, item.name);
+      await attempt(target, () => rm(target, { recursive: true, force: true, maxRetries: 5, retryDelay: 120 }));
+    }
+  }
+
+  return { removed, kept };
+}
+
+/** Wait for the Web carrier before registering routes; apply may run first on boot. */
+export const inject = ['webServer'];
 
 /** Register the updater route. Normal reminders never touch the network. */
 export function apply(ctx) {
@@ -453,6 +590,34 @@ export function apply(ctx) {
     }
   };
 
+  /*
+   * Runs while the plugin still can answer: the client asks for this right
+   * before it hands the uninstall to the plugin manager, so a leftover link or
+   * temporary directory cannot make the next install fail with EPERM.
+   */
+  const uninstallHandler = async (req, res) => {
+    try {
+      if (req.method !== 'POST') {
+        sendJson(res, 405, { ok: false, error: 'method not allowed' });
+        return;
+      }
+      if (rejectUnauthorized(req, res)) return;
+      const body = await readJsonBody(req);
+      if (body.action !== undefined && body.action !== 'cleanup') {
+        sendJson(res, 400, { ok: false, error: 'unknown uninstall action' });
+        return;
+      }
+      const profileDir = profileDirectory(ctx);
+      if (profileDir === null) {
+        sendJson(res, 200, { ok: false, error: 'the profile directory is unknown here' });
+        return;
+      }
+      sendJson(res, 200, { ok: true, ...await cleanUninstallLeftovers(profileDir) });
+    } catch (error) {
+      sendJson(res, 200, { ok: false, error: messageOf(error) });
+    }
+  };
+
   ctx.effect(() => webServer.register({
     kind: 'exact',
     path: ROUTE_PATH,
@@ -464,4 +629,10 @@ export function apply(ctx) {
     path: FOREGROUND_PATH,
     handler: foregroundHandler,
   }), 'completed-ding: foreground route');
+
+  ctx.effect(() => webServer.register({
+    kind: 'exact',
+    path: UNINSTALL_PATH,
+    handler: uninstallHandler,
+  }), 'completed-ding: uninstall route');
 }

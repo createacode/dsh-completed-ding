@@ -1,8 +1,10 @@
 {
   "name": "dsh-completed-ding",
-  "version": "1.5.4",
+  "version": "1.5.16",
   "private": true,
   "description": "A warm bottom-right alert for completed, failed, or waiting-for-answer sessions, switchable between in-app cards, desktop notifications, and a floating window, with audio, workspace opening, and one-click or daily automatic Gitee updates.",
+  "author": "XAF",
+  "homepage": "https://gitee.com/user_gitee/dsh-completed-ding",
   "type": "module",
   "exports": {
     ".": "./index.js",
@@ -11,12 +13,15 @@
     "./icon": "./icon.svg"
   },
   "files": [
+    "package.json",
     "index.js",
     "client.js",
     "cordis.patch.yml",
-    "locale/*.json",
+    "locale/zh.json",
+    "locale/en.json",
     "icon.svg",
-    "sounds/*.mp3"
+    "sounds/您的任务完成啦，请查看（可爱）.mp3",
+    "sounds/您的任务已完成，请查看（知性）.mp3"
   ],
   "dsh": {
     "bundle": {

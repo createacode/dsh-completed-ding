@@ -36,9 +36,9 @@
 | 项目 | 值 |
 | --- | --- |
 | 包名 | `dsh-completed-ding` |
-| 包版本 | `1.5.4` |
+| 包版本 | `1.5.16` |
 | 类型 | ESM / 无构建 |
-| Host 入口 | `index.js`（Gitee 更新路由 + Windows 前台全屏检测） |
+| Host 入口 | `index.js`（Gitee 更新路由 + Windows 前台全屏检测 + 卸载残留清理） |
 | Client 入口 | `client.js` |
 | Bundle 入口 | `cordis.patch.yml` |
 | 客户端运行格式 | `window.__ModuleLoader__.load({ id, factory })` |
@@ -72,6 +72,7 @@
 │  · remote.pluginManager（卸载）                              │
 │  · webServer / connection → /completed-ding/update       │
 │  · /completed-ding/foreground → Win32 前台全屏检测        │
+│  · /completed-ding/uninstall → 卸载前清理 node_modules 残留 │
 │  · Gitee API（仅检查/应用更新时）                             │
 │  · uiWorkspace（跳转会话，客户端服务）                        │
 └───────────────────────────┬────────────────────────────────┘
@@ -98,14 +99,15 @@
 │   └─ floating mode: Document PiP → always-on-top window     │
 │                                                            │
 │  SettingsPage                                               │
-│   ├─ 配置 / 预览 / 卸载                                     │
+│   ├─ 配置 / 预览 / 更新入口 / 卸载                          │
+│   ├─ 卸载 → POST /completed-ding/uninstall → removeBundle  │
 │   └─ 版本与更新 → POST /completed-ding/update            │
 └────────────────────────────────────────────────────────────┘
 ```
 
-### Host half 负责更新与前台检测
+### Host half 负责更新、前台检测与卸载清理
 
-`index.js` 注册两个同源、已认证路由：
+`index.js` 注册三个同源、已认证路由：
 
 - `POST /completed-ding/update`：
   - `check`：读取 Gitee `master` 的 `package.json` 并比较版本。
@@ -115,6 +117,18 @@
     落盘时提前重载。
 - `GET /completed-ding/foreground`：Windows 前台窗口全屏检测，供 Windows 通知
   全屏静音使用。
+- `POST /completed-ding/uninstall`：卸载前清理残留（`action: 'cleanup'`）。
+  - 删掉本地目录安装留下的 `node_modules/dsh-completed-ding` 目录联接（只删联接，
+    不动联接指向的源码目录）。
+  - 删掉 pnpm 的 `node_modules/dsh-completed-ding_tmp_*` 与
+    `node_modules/.ignored/dsh-completed-ding_tmp_*` 临时目录。
+  - **不会**删除当前正在运行的包目录：那一步留给插件管理器的 `pnpm remove`，
+    这样移除失败时 profile 不会处于半卸载状态。
+  - 返回 `removed` / `kept`（`kept` 带原因），供客户端在成功提示里报数量。
+
+`index.js` 导出 `inject = ['webServer']`：Cordis 会等 Web carrier 就绪后再执行
+`apply`。如果 `apply` 先于 `webServer` 运行，旧实现会直接 return，路由永远不会注册，
+客户端更新就会落到 SPA fallback 并得到 HTTP 405。
 
 没有 `webServer` 时直接返回，不影响提醒功能。Host 仍然没有定时器、轮询或常驻
 网络任务；Gitee 请求由客户端的每日检查或设置页手动检查触发。
@@ -170,7 +184,8 @@ const inject = [
 | Slot | id | order | 组件 | 作用 |
 | --- | --- | --- | --- | --- |
 | `shell.overlay` | `completed-ding.toast` | 80 | `ToastLayer` | 全窗口浮层里的提醒卡片 |
-| `sidebar.panellist` | `completed-ding` | 30 | `PanelIcon` | 左侧栏「完成提醒」入口 |
+| `sidebar.panellist` | `completed-ding` | 30 | `PanelIcon` | 左侧栏「完成提醒」入口（可随设置注销） |
+| `plugins.bundle.config` | key = `dsh-completed-ding` | — | `PluginPlacementCell` | 「插件」页详情里的入口开关 |
 | `main` | key = `completed-ding` | — | `SettingsPage` | 设置页 |
 
 `shell.overlay` 的 inject 面：
@@ -190,11 +205,14 @@ inject: () => ({
 ```js
 const runtime = {
   remote: null,
+  openPanel: () => false,
+  openPanelAvailable: false,
   openPluginManager: () => false,
 };
 ```
 
-`apply()` 里填充它。这样设置页可以在不额外声明 slot inject 的情况下访问卸载服务。
+`apply()` 里填充它。这样设置页和「插件」页的配置卡可以在不额外声明 slot inject 的情况下
+访问卸载服务与面板导航（`ctx.get('layout').selectPanel`）。
 
 ### 2.3 标准 props
 
@@ -628,8 +646,9 @@ documentPictureInPicture.requestWindow({
 - `CloseIcon`：关闭
 - `HelpIcon`：待回答问号
 - `ChatIcon`：会话标签
-- `TrashIcon`：卸载
-- `PanelIcon`：左侧栏果冻脸图标
+- `UpdateIcon`：更新（循环箭头）
+- `UninstallIcon`：卸载（方盒 + 向上箭头「取出」，不画垃圾桶）
+- `PanelIcon`：左侧栏小熊图标
 
 新增图标时保持 `currentColor` + `aria-hidden`，避免把颜色写死。
 
@@ -740,17 +759,19 @@ return portalHost && ReactDOM?.createPortal
 结构：
 
 1. 隐藏的文件输入（自定义音频）。
-2. Hero：吉祥物、标题、副标题、右上角卸载图标。
+2. Hero：吉祥物、标题、副标题、右上角两个按钮 —— 「更新」（`UpdateIcon`，就地跑一次手动检查）与「卸载」（`UninstallIcon` + 文字）。
 3. 总开关卡片。
-4. 操作行：预览提醒 / 预览失败 / 预览待回答 / 试听 / 恢复默认。
-5. 提醒内容卡片。
-6. 声音与提醒卡片：通知位置、声音开关/来源、音量、时长、间隔。
-7. 提醒范围卡片。
-8. 版本与更新卡片：当前版本、每日自动更新模式、检查、确认、更新、刷新、Gitee 链接。
-9. 关于卡片：标题「关于」、软件全称 **DSH会话完成提醒**、版本、AGPL-3.0、Gitee 仓库入口。
-10. 右上角更新提示卡（`UpdatePrompt`，由 shell.overlay 单独注册）。
-11. 备注。
-12. 卸载确认 modal（条件渲染）。
+4. 入口卡片：「在左侧栏显示」开关（`sidebarEntry`），关闭后收进「插件」页。
+5. 操作行：预览提醒 / 预览失败 / 预览待回答 / 试听 / 恢复默认。
+6. 提醒内容卡片。
+7. 声音与提醒卡片：通知位置、声音开关/来源、音量、时长、间隔。
+8. 提醒范围卡片。
+9. 版本与更新卡片：当前版本、每日自动更新模式、检查、确认、更新、刷新、Gitee 链接。
+10. 关于卡片：顶行「关于」+ 版本徽章；品牌行（`CheckIcon` + 全称 + 简介）；元信息行「作者 · 许可证 · 仓库」；分隔线后是版权行（`about.copyright`，`copyrightYears()` 按渲染时的年月生成 `2026.10–YYYY.MM`）与隐私说明。
+11. 右上角更新提示卡（`UpdatePrompt`，由 shell.overlay 单独注册）。
+12. 备注。
+13. 更新确认 modal（`confirmingUpdate`，条件渲染）：发现新版本时自动打开，含「立即更新 / 稍后」。
+14. 卸载确认 modal（条件渲染）。
 
 设置控件：
 
@@ -774,16 +795,18 @@ latest/error → checking
 
 卸载 modal：
 
-- 由右上角 `TrashIcon` 按钮打开。
+- 由右上角 `UninstallIcon` 按钮打开。
 - `role="alertdialog"`，`aria-modal="true"`。
 - 状态：`idle → busy → done | restart | cancelled | manual | opened | error`。
-- 成功时保留 modal，提供“刷新页面”；需要重启时提示重启；失败显示错误并可重试。
+- 成功时关闭悬浮窗、移除注入样式，并保留 modal 提示 900 ms 后自动刷新（“刷新页面”按钮兜底）；需要重启时提示重启；失败显示错误并可重试。
 - 遮罩点击在非 busy 状态取消。
 - 关闭/取消按钮在 busy 时禁用。
 
 ### 6.5 `PanelIcon`
 
-左侧栏图标是独立的果冻脸 SVG，不是 `JellyMascot`；它只负责入口呈现和 active 态。
+左侧栏图标是一只圆脸小熊：两只圆耳朵、圆脑袋、点状眼睛和一条弧线笑嘴，
+全部用 `currentColor` 填充、五官用 `--dsw-alias-bg-base` 挖空，深浅色主题共用。
+它不使用 `JellyMascot`，只负责入口呈现和 active 态。比早先那枚“尖脸”猫头更圆、更安静。
 
 ---
 
@@ -917,6 +940,10 @@ pointer-events: none;
 ```js
 const DEFAULT_SETTINGS = Object.freeze({
   enabled: true,
+  sidebarEntry: 'sidebar',
+  deliveryMode: 'auto',
+  autoUpdateMode: 'off',
+  suppressWindowsFullscreen: true,
   soundEnabled: true,
   soundKind: 'chime',
   volume: 0.55,
@@ -952,6 +979,8 @@ const LIMITS = Object.freeze({
 | `dsh-completed-ding.settings.v2` | 当前设置 JSON |
 | `dsh-completed-ding.settings.v1` | 旧设置（迁移源） |
 | `dsh-completed-ding.sound.v1` | 自定义音频 `{ name, dataUrl }` |
+| `dsh-completed-ding.update-check.v1` | 上次自动检查更新的时间戳 |
+| `dsh-completed-ding.seen-version.v1` | 上次加载的插件版本，用于判断本次加载是否发生了更新 |
 
 ### 8.3 v1 → v2 迁移
 
@@ -1092,33 +1121,61 @@ uiWorkspace.openSession(notice.sessionId)
 
 入口：
 
-- 设置页右上角 `TrashIcon`。
+- 设置页右上角「卸载」按钮（`UninstallIcon` 取出图标 + 「卸载」文字）。
 - 打开确认 modal。
 
-执行：
+执行顺序：
 
 ```js
-runtime.remote.pluginManager.removeBundle('dsh-completed-ding')
+// 1. 先让 Host 清掉上一次安装/卸载的残留（1.5.8+）
+await fetch('/completed-ding/uninstall', {
+  method: 'POST',
+  headers: { 'content-type': 'application/json' },
+  credentials: 'same-origin',
+  body: JSON.stringify({ action: 'cleanup' }),
+});
+
+// 2. 再交给插件管理器
+await runtime.remote.pluginManager.removeBundle('dsh-completed-ding');
 ```
+
+为什么先清理：Windows 上 pnpm 安装包时会把临时目录 `rename` 成
+`node_modules/dsh-completed-ding`。如果这个名字已被占用（本地目录安装留下的
+junction，或上次失败留下的 `*_tmp_*`），`rename` 返回 `EPERM`，DSH 显示
+「没有写入权限，无法安装」。卸载时清掉它们，重装就不会再撞名、也不会留下垃圾。
+
+清理范围（相对 profile 目录，`profileContext.dir`）：
+
+- `node_modules/dsh-completed-ding`：是符号链接/junction 时只删链接本身
+  （`rmdir`，不跟随目标）；是普通目录且 `package.json.name` 匹配时才递归删除。
+- `node_modules/dsh-completed-ding_tmp_*` 与
+  `node_modules/.ignored/dsh-completed-ding_tmp_*`。
+- 当前正在运行的那个包目录**不删**，留给 `pnpm remove`；否则移除失败会让
+  profile 处于「清单还在、文件没了」的半卸载状态。
 
 结果处理：
 
 | 结果 | UI |
 | --- | --- |
-| `answer.ok === false` | 显示 `answer.error.message` |
-| `value.error.code === 'stop-profile'` | 提示到插件页/手动卸载 |
+| `answer.ok === false` | 显示 `answer.error.message`；`not-removable` / `stop-profile` / `bundle-in-use` 映射为可操作文案 |
+| `value.error.code === 'stop-profile'` | 提示到插件页/重启后卸载 |
 | `value.application === 'failed'` | 显示 error diagnostic / code |
 | `value.application === 'cancelled'` | 显示已取消 |
 | `value.application === 'restart-required'` | 提示重启 DSH |
-| 其他成功值 | 显示已卸载 + 刷新按钮 |
+| 其他成功值 | 显示已卸载 + 清理数量，关闭悬浮窗、移除注入样式，900 ms 后自动 `location.reload()` |
+
+自动刷新是为了让侧栏入口和设置页一起消失；手动「刷新页面」按钮保留为兜底。
 
 降级：
 
 - `remote.pluginManager` 不存在 → `runtime.openPluginManager()`。
 - `pluginNavigation.openBundle('dsh-completed-ding')` 可用 → 打开插件详情页。
 - 都不可用 → 提示去左侧「插件」页。
+- 旧版 Host 没有 `/completed-ding/uninstall` → 清理请求静默失败，卸载照常进行。
 
-不要直接删 `node_modules` 或改 profile 文件来“模拟卸载”；那会绕过插件管理器的锁、pnpm 状态和热重载。
+不要在插件里直接删当前运行的 `node_modules` 或改 profile 文件来“模拟卸载”；
+那会绕过插件管理器的锁、pnpm 状态和热重载。残留需要人工处理时，按使用手册
+[安装与卸载失败](./README.md#安装与卸载失败)里的相对路径操作。
 
 ### 10.4 检查更新与热更新
 
@@ -1127,20 +1184,43 @@ runtime.remote.pluginManager.removeBundle('dsh-completed-ding')
 ```text
 POST /completed-ding/update
 { "action": "check" }
-{ "action": "apply", "version": "1.5.4" }
+{ "action": "apply", "version": "1.5.16" }
 ```
 
 Host 半边：
 
-1. `check` 读取 Gitee 仓库默认分支的 `package.json`，返回
+1. `check` 用 **raw 地址**读取 Gitee `master` 的 `package.json`，返回
    `currentVersion` / `latestVersion` / `available` / `repoUrl`。
+   只有 raw 返回 404（默认分支被改名）时才调用一次 API 查 `default_branch`。
 2. `apply` 重新读取最新版本，确认版本没有被仓库移动。
-3. 按最新 `package.json.files` 收集运行文件：
-   `package.json`、`index.js`、`client.js`、`cordis.patch.yml`、`locale/*.json`、
-   `icon.svg`、`sounds/*.mp3`。
+3. 按最新 `package.json.files` 收集运行文件（1.5.12 起为显式路径）：
+   `package.json`、`index.js`、`client.js`、`cordis.patch.yml`、`locale/zh.json`、
+   `locale/en.json`、`icon.svg`、`sounds/*.mp3`。
+   - 每个文件也用 raw 地址下载，不消耗 Gitee API 额度。
+   - 遗留的 glob（`locale/*.json`）才走一次 `/contents` 列目录，结果按分支+目录缓存 5 分钟。
 4. 校验包名、`client.js` 语法、Host 入口和 bundle 名称。
 5. 逐文件比较；只写有变化的文件，`client.js` 最后写入。写入失败按备份回滚。
 6. 返回 `applied` / `files` / `restartRequired`。
+
+限流（Gitee 匿名 API 约 60 次/小时/IP）：
+
+- `giteeFailure()` 把 403 且响应含 `rate limit`、或 429，统一翻译成
+  「Gitee 接口限流（403）……」并带上 `error.rateLimited`。
+- 客户端 `updateFailure()` 识别该文案，直接显示这条中文说明，而不是原始 JSON。
+- 「更新」按钮 30 秒冷却（`MANUAL_CHECK_COOLDOWN_MS`），期间只出提示不请求。
+
+更新完成提醒：
+
+- `ToastLayer` 挂载时用 `readSeenVersion()` 读 `localStorage` 的
+  `dsh-completed-ding.seen-version.v1`（上次加载的版本），随后立刻
+  `writeSeenVersion(PLUGIN_VERSION)`。
+- 读取到旧版本且与 `PLUGIN_VERSION` 不同，说明运行文件刚被替换过（热更新、手动覆盖
+  或重启后加载新代码），用 `makeDemoNotice('updated', { version })` 生成一张普通完成
+  卡片：工作区行「完成提醒已更新」，任务行「已更新到 vX.Y.Z」，并播放一次当前提示音。
+- 这条判断不依赖更新流程本身，热更新、手动覆盖文件、`restart-required` 后重启都会命中；
+  首次安装没有旧版本记录，不会弹。之后再刷新页面版本相同，保持安静。
+- 边界：旧版本不会写这个键，所以 **1.5.8 → 1.5.9 这一次不弹**；从 1.5.9 起每次加载都会
+  记录自己的版本，之后的更新才会提醒。主开关关闭时同样不弹，但版本照常写入。
 
 安全与边界：
 
@@ -1155,9 +1235,17 @@ Host 半边：
 客户端：
 
 - `PLUGIN_VERSION` 必须和 `package.json.version` 一致。
+- Hero 的 `runUpdateCheck` 就地发起一次手动检查，不滚动页面；`checking` / `updating` 时按钮禁用，
+  30 秒内重复点击只显示「刚检查过，请稍等半分钟」。
+- `updateNote` 由 `update.status` 派生，显示在按钮下方：检查中 / 更新中 / 发现 vX.Y.Z / 已是最新 / 检查失败。
 - `checking → latest/available/error`、`available → confirm → updating → done/restart/error`
   状态机；
-- `done` 后 1.6 秒刷新页面；`restart` 留给用户重启 DSH。
+- 手动检查（Hero 的「更新」或卡片里的「检查更新」）一旦发现新版本，直接 `setConfirmingUpdate(true)`
+  打开确认弹窗：`available` 时显示「立即更新 / 稍后」，`updating` 时显示下载提示并锁住按钮，
+  `error` 时显示错误并给「重试」，`done` / `restart` 显示结果后关闭或刷新；「稍后」之后
+  Hero 下方的「发现 vX.Y.Z · 立即更新」可以再次打开弹窗。
+- `done` 后 1.6 秒刷新页面；`restart` 留给用户重启 DSH。两者刷新/重启后，新页面都会因为
+  `seen-version` 变化而弹出更新完成卡片。
 - 手动检查只在点击按钮时请求；自动检查见 10.5。
 
 ### 10.5 每日自动更新
@@ -1175,6 +1263,7 @@ Host 半边：
 - 检查失败不写时间戳，下个 tick 重试；成功检查才写。
 - 设置切换 `autoUpdateMode` 时触发一次检查；已有 24h 时间戳则不会重复请求。
 - 自动检查/更新仍走 `POST /completed-ding/update`，复用 Host 的校验、写入顺序和回滚。
+- `install` 模式更新成功后页面同样刷新，新页面会因 `seen-version` 变化弹出一次更新完成卡片。
 
 提示：
 
@@ -1182,6 +1271,21 @@ Host 半边：
   `shell.overlay`（id `completed-ding.update`，order 81），右上角显示。
 - Windows 通知的更新提示只包含标题/正文；点击只聚焦 DSH，不直接执行更新。
 - 全屏静音开关同样作用于更新提示：其他应用全屏时跳过 Windows 更新通知。
+
+### 10.6 侧栏入口与插件页入口
+
+`sidebarEntry`（`sidebar` 默认 / `plugins`）决定入口位置：
+
+- `apply()` 里不再一次性注册侧栏项，而是 `mountSidebarEntry()` /
+  `unmountSidebarEntry()` 配合 `subscribeSettings(syncSidebarEntry)`：
+  设置一改就注册或注销，**立即生效，无需刷新**。
+- 注销只移除 `sidebar.panellist` 注册；`main` 面板（key `completed-ding`）始终在，
+  因此 `runtime.openPanel()`（`ctx.get('layout').selectPanel(PANEL_ID)`）随时能打开设置。
+- `plugins.bundle.config`（keyed，key = 包名 `dsh-completed-ding`）注册
+  `PluginPlacementCell`，在「插件 → 完成提醒」详情页渲染同一个开关和一个
+  「打开完成提醒设置」按钮；`view === 'summary'` 时只输出一行状态。
+- 旧版 DSH 没有 `plugins.bundle.config` 时，`slots.inject` 不会触发，页面少一块配置，
+  侧栏开关仍可用。
 
 ---
 
@@ -1191,7 +1295,7 @@ Host 半边：
 
 | 区块 | 关键符号 | 职责 |
 | --- | --- | --- |
-| 常量 | `NS`, `PLUGIN_VERSION`, `UPDATE_ROUTE`, `SETTINGS_KEY`, `LIMITS`, `DEFAULT_SETTINGS` | 标识、版本、更新路由、存储、限制、默认值 |
+| 常量 | `NS`, `PLUGIN_VERSION`, `UPDATE_ROUTE`, `UNINSTALL_ROUTE`, `SEEN_VERSION_KEY`, `UNINSTALL_CODE_KEYS`, `SETTINGS_KEY`, `LIMITS`, `DEFAULT_SETTINGS` | 标识、版本、路由、卸载失败码、存储、限制、默认值 |
 | 国际化 | `zh`, `en` | 文案；两套必须同步 |
 | 设置 | `normalizeSettings`, `readStoredSettings`, `saveSettings`, `useSettings` | 读取/迁移/持久化/订阅 |
 | 音频 | `ensureAudioContext`, `playChime`, `CHIME_PRESETS`, `playAudioSource`, `playConfiguredSound`, `applyShortSound` | 短音预设、语音/自定义音频 |
@@ -1200,17 +1304,22 @@ Host 半边：
 | 每日自动更新 | `startAutoUpdate`, `checkDailyUpdate`, `applyAutoUpdate`, `updatePromptState`, `UpdatePrompt` | 24h 检查、提示/自动安装、更新卡片 |
 | Host 全屏检测 | `foregroundFullscreen`（index.js） | Win32 前台窗口矩形检测、缓存 |
 | 悬浮窗 | `openFloatingWindow`, `closeFloatingWindow`, `floatingState` | Document PiP 置顶窗口、Portal、生命周期 |
-| 图标 | `CheckIcon` … `TrashIcon`, `PanelIcon` | SVG |
+| 图标 | `CheckIcon` … `UpdateIcon`, `UninstallIcon`, `PanelIcon` | SVG |
 | 吉祥物 | `JellyMascot` | 表情、眼睛跟随 |
 | 文本 | `truncate`, `classifyFailure`, `summarizeError`, `basename` | 纯函数 |
 | 工作区 | `resolveWorkspace` | 会话 → 工作区 |
 | 提醒模型 | `makeNotice`, `waitingFacts`, `makeWaitingNotice` | 构造 notice |
-| 设置页 | `SettingsPage` | 表单、预览、更新卡片、卸载 modal |
+| 更新完成提醒 | `readSeenVersion`, `writeSeenVersion`, `makeDemoNotice('updated')` | 版本变化时只弹一次的完成卡片 |
+| 设置页 | `SettingsPage`, `runUpdateCheck`, `updateNote` | 表单、预览、更新卡片、卸载 modal、右上角更新/卸载入口 |
+| 关于 | `COPYRIGHT_START`, `copyrightYears` | 动态版权年份（`2026.10–YYYY.MM`） |
+| 入口 | `syncSidebarEntry`, `mountSidebarEntry`, `unmountSidebarEntry`, `PluginPlacementCell`, `runtime.openPanel` | 侧栏入口随设置动态注册、「插件」页同款开关 |
+| 卸载 | `confirmUninstall`, `uninstallReason`, `releasePageAfterUninstall`, `cleanupInstallLeftovers` | 清理残留 → `removeBundle` → 自动刷新 |
 | 提醒层 | `ToastLayer` | 状态订阅、队列、渲染、Portal |
 | CSS | `CSS` 模板字符串 | 全部样式 |
 | 样式注入 | `insertStyles` | 去重插入 |
 | 注册 | `inject`, `apply` | 服务、slot、生命周期 |
-| Host 更新 | `checkForUpdate`, `applyUpdate`, `downloadRuntimeFiles`, `safeTarget` | Gitee 检查、校验、热更新 |
+| Host 更新 | `checkForUpdate`, `applyUpdate`, `downloadRuntimeFiles`, `readRaw`, `listDirectory`, `giteeFailure`, `safeTarget` | Gitee 检查、校验、热更新；raw 取文件、限流说明 |
+| Host 卸载清理 | `cleanUninstallLeftovers`, `profileDirectory`, `TEMPORARY_DIRECTORY`（index.js） | 目录联接、pnpm 临时目录清理；只删本插件的残留 |
 
 `ToastLayer` 内部关键闭包：
 
@@ -1219,7 +1328,7 @@ Host 半边：
 - `showCompletion` / `scheduleCompletion` / `cancelCompletion`
 - `showWaiting` / `dismissWaiting` / `waitingIdentity`
 - `openWorkspace` / `openWaiting`
-- 状态 effect、启用/等待开关 effect、卸载清理 effect
+- 状态 effect、启用/等待开关 effect、卸载清理 effect、更新完成提示 effect
 
 ---
 
@@ -1267,7 +1376,7 @@ Host 半边：
 
 - 浏览器 DevTools Console：看模块加载和运行时错误。
 - Elements：搜索 `.dcd-toast-root`、`.dcd-toast`、`.dcd-page`。
-- Application → Local Storage：检查三个存储键。
+- Application → Local Storage：检查上面的存储键。
 - Network：正常使用时不应有插件发起的请求（宿主自身请求除外）。
 - React DevTools：检查 `ToastLayer` / `SettingsPage` 的 state。
 - 样式：直接改 `.dcd-toast` 的 CSS 变量做临时对比。
@@ -1371,6 +1480,9 @@ Host 半边：
 - 问题文本/错误文本作为纯文本渲染（React 转义），不注入 HTML。
 - 自定义音频只读取用户选择的文件，限制 2 MB，存为 Data URL。
 - 卸载操作走官方 `pluginManager.removeBundle`，不直接改 profile 文件。
+- 卸载清理路由同样要求认证；只删本插件的 `node_modules/dsh-completed-ding` 链接/
+  目录与 `dsh-completed-ding_tmp_*`，删除前校验包名或链接类型，越界路径与陌生目录
+  一律跳过并回报 `kept`。
 - `localStorage` 可能被禁用/占满，所有读写都有 try/catch，失败不阻断提醒。
 
 ---
@@ -1390,6 +1502,9 @@ Host 半边：
 - **待回答依赖宿主投影：** 宿主不暴露 `pendingInteraction` 时无法提醒。
 - **自定义音频 2 MB：** 受 localStorage 配额限制。
 - **卸载需要管理器：** 没有 `remote.pluginManager` 时只能退化为打开插件页/手动卸载。
+- **入口位置依赖槽位：** 「插件」页里的入口开关注册在 `plugins.bundle.config`；旧版 DSH
+  没有这个槽位时不会渲染，侧栏开关本身仍然可用（打开设置由 `ctx.layout.selectPanel` 完成）。
+- **卸载残留靠 Host 路由清理：** 旧版 Host 没有 `/completed-ding/uninstall` 时，清理请求静默失败，目录联接/临时目录仍需按使用手册手动删除（Windows 上会表现为重装 `EPERM`）。
 - **热更新需要 Web 宿主：** 没有 `webServer` / `connection` 时提醒照常，但「检查更新」不可用。
 - **更新写权限：** 插件安装目录必须可写；只读包或受保护目录会提示失败，可回到插件管理器手动更新。
 - **首次启用更新路由可能需要重启：** 1.1.0 新增 Host 路由；如果当前进程没有热加载 Host 文件，重启一次 DSH 后再使用按钮。
@@ -1423,7 +1538,7 @@ Host 半边：
 ### 版本号约定
 
 - Git 提交：日期序号（`11.02-1`），用于追加变更。
-- `package.json`：包语义版本，当前 `1.5.4`；功能或更新机制变化时 bump。
+- `package.json`：包语义版本，当前 `1.5.16`；功能或更新机制变化时 bump。
 - `client.js` 的 `PLUGIN_VERSION` 必须与 `package.json` 一致，否则设置页显示和
   更新比较会错位。
 - `docs/README.md` 的更新记录是用户能读懂的权威变更摘要。
@@ -1460,10 +1575,18 @@ Host 半边：
 - [ ] 自定义音频超 2MB / 非音频：有错误提示。
 - [ ] 刷新后：设置保留；旧 20 秒迁移正确；pending 问题重新提醒。
 - [ ] 检查更新：同源 POST 可用；未登录/跨源被拒绝。
+- [ ] 更新完成提醒：更新后刷新，右下角出现「完成提醒已更新 / 已更新到 vX.Y.Z」卡片，只出现一次，刷新后不再重复。
+- [ ] 关于卡片：版本徽章在标题行右侧；作者 / 许可证 / 仓库一行；版权行显示 `Copyright © XAF 2026.10–当前年月`，跨月后刷新页面应显示新的年月。
+- [ ] 更新确认弹窗：点右上角「更新」，发现新版本时自动弹出；「立即更新」开始下载并刷新；「稍后」后按钮下方出现「发现 vX.Y.Z · 立即更新」，可再次打开；失败时弹窗显示原因并可重试。
 - [ ] 最新版本：显示已是最新，不写文件。
 - [ ] 有更新：确认后只替换运行文件，`client.js` 最后写入，页面可刷新。
 - [ ] 更新失败：`client.js` 保持原样或回滚，设置不丢。
-- [ ] 卸载：确认框、成功/重启/失败路径。
+- [ ] 入口：关掉「在左侧栏显示」后侧栏入口立即消失；「插件 → 完成提醒」里出现同款开关和「打开设置」；点开后设置页正常，切回开关侧栏入口立即回来；刷新后保持。
+- [ ] 卸载：确认框、成功/重启/失败路径；右上角是「更新（循环箭头）+ 卸载（取出）」两个带文字按钮，没有垃圾桶图标；点更新会就地检查并在按钮下方显示结果。
+- [ ] 卸载清理：profile 里预置一个 `node_modules/dsh-completed-ding` junction 和
+      `dsh-completed-ding_tmp_*` 后点卸载，链接与临时目录被清掉、源码目录完好，
+      重装不再报 `EPERM`。
+- [ ] 卸载成功后页面自动刷新，侧栏入口消失；旧 Host（无清理路由）时卸载仍能完成。
 - [ ] 减少动态效果：动画和眼睛跟随关闭。
 - [ ] 窗口缩放/侧栏开关：仍贴右下角。
 

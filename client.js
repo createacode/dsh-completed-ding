@@ -12,17 +12,37 @@ window.__ModuleLoader__.load({
 
     const NS = 'completed-ding';
     const PANEL_ID = 'completed-ding';
-    const PLUGIN_VERSION = '1.5.4';
+    /* The bundle's package name: the key its Plugins-page configuration uses. */
+    const PACKAGE_NAME = 'dsh-completed-ding';
+    const PLUGIN_VERSION = '1.5.16';
     const UPDATE_ROUTE = '/completed-ding/update';
     const FOREGROUND_ROUTE = '/completed-ding/foreground';
+    const UNINSTALL_ROUTE = '/completed-ding/uninstall';
     const UPDATE_REPO_URL = 'https://gitee.com/user_gitee/dsh-completed-ding';
+    const AUTHOR_NAME = 'XAF';
+    /* The copyright starts here and ends at whatever month the page is rendered. */
+    const COPYRIGHT_START = '2026.10';
+
+    function copyrightYears(now = new Date()) {
+      const month = `${now.getFullYear()}.${String(now.getMonth() + 1).padStart(2, '0')}`;
+      return month === COPYRIGHT_START ? COPYRIGHT_START : `${COPYRIGHT_START}–${month}`;
+    }
     const UPDATE_CHECK_KEY = 'dsh-completed-ding.update-check.v1';
+    const SEEN_VERSION_KEY = 'dsh-completed-ding.seen-version.v1';
     const AUTO_CHECK_INTERVAL_MS = 60 * 60 * 1000;
     const DAILY_CHECK_MS = 24 * 60 * 60 * 1000;
+    /* Gitee limits anonymous API calls, so a second manual check waits. */
+    const MANUAL_CHECK_COOLDOWN_MS = 30 * 1000;
     const SETTINGS_KEY = 'dsh-completed-ding.settings.v2';
     const LEGACY_SETTINGS_KEY = 'dsh-completed-ding.settings.v1';
     const CUSTOM_SOUND_KEY = 'dsh-completed-ding.sound.v1';
     const MAX_CUSTOM_SOUND_BYTES = 2 * 1024 * 1024;
+    /* Plugin-manager failure codes the uninstall dialog explains in words. */
+    const UNINSTALL_CODE_KEYS = {
+      'not-removable': 'uninstall.code.notRemovable',
+      'stop-profile': 'uninstall.code.stopProfile',
+      'bundle-in-use': 'uninstall.code.bundleInUse',
+    };
     const EXIT_MS = 180;
     const EMPTY_STATUS = new Map();
     const CHIME_KINDS = ['chime', 'chime-bright', 'chime-soft', 'chime-wood', 'chime-drop', 'chime-dingdong'];
@@ -177,6 +197,25 @@ window.__ModuleLoader__.load({
         /* storage is optional */
       }
     };
+    /*
+     * The version this browser loaded last time. A different value on load means
+     * the runtime files were replaced (hot update or manual copy), so the page
+     * greets the user once with a completion card.
+     */
+    const readSeenVersion = () => {
+      try {
+        return globalThis.localStorage ? globalThis.localStorage.getItem(SEEN_VERSION_KEY) : null;
+      } catch {
+        return null;
+      }
+    };
+    const writeSeenVersion = (version) => {
+      try {
+        if (globalThis.localStorage) globalThis.localStorage.setItem(SEEN_VERSION_KEY, version);
+      } catch {
+        /* storage is optional */
+      }
+    };
     let autoUpdateBusy = false;
 
     async function callUpdate(action, extra = {}) {
@@ -192,6 +231,29 @@ window.__ModuleLoader__.load({
       }
       if (!payload || payload.ok !== true) {
         throw new Error(payload && payload.error ? payload.error : 'unknown update error');
+      }
+      return payload;
+    }
+
+    /*
+     * Ask the Host half to drop what an earlier install or uninstall may have
+     * left in the profile's node_modules: a directory link from a local-path
+     * install, and pnpm's temporary directories. Both block the next install
+     * with EPERM on Windows, so the uninstall clears them while it still runs.
+     */
+    async function cleanupInstallLeftovers() {
+      const response = await globalThis.fetch(UNINSTALL_ROUTE, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        credentials: 'same-origin',
+        body: JSON.stringify({ action: 'cleanup' }),
+      });
+      const payload = await response.json().catch(() => null);
+      if (!response.ok) {
+        throw new Error(payload && payload.error ? payload.error : `HTTP ${response.status}`);
+      }
+      if (!payload || payload.ok !== true) {
+        throw new Error(payload && payload.error ? payload.error : 'unknown uninstall error');
       }
       return payload;
     }
@@ -377,6 +439,7 @@ window.__ModuleLoader__.load({
 
     const DEFAULT_SETTINGS = Object.freeze({
       enabled: true,
+      sidebarEntry: 'sidebar',
       deliveryMode: 'auto',
       autoUpdateMode: 'off',
       suppressWindowsFullscreen: true,
@@ -435,14 +498,33 @@ window.__ModuleLoader__.load({
       'settings.master.desc': '关闭后不再弹出完成、失败或待回答提醒，也不会播放声音；左侧栏入口仍保留，随时可以重新开启。',
       'settings.master.on': '已开启',
       'settings.master.off': '已关闭',
-      'settings.note': '这些设置与自定义音频仅保存在当前浏览器中，不写入会话记录。日常提醒不联网；只有点击「检查更新」或触发每日自动更新检查时才会访问 Gitee。',
+      'placement.section': '入口',
+      'placement.title': '在左侧栏显示',
+      'placement.desc': '关闭后收进「插件」页，可在那里打开设置，立即生效。',
+      'placement.summarySidebar': '左侧栏入口：显示',
+      'placement.summaryPlugins': '左侧栏入口：已收进插件页',
+      'placement.open': '打开完成提醒设置',
       'about.title': '关于',
       'about.name': 'DSH会话完成提醒',
       'about.tagline': '专注 DSH 的每一次会话收尾：完成、失败、待回答都会温柔提醒；支持失败原因归类、提问/计划/授权提醒、多种轻提示音、工作区直达，以及 Windows 通知与桌面悬浮窗。',
+      'about.author': '作者：{name}',
       'about.license': 'AGPL-3.0',
       'about.repo': 'Gitee 仓库',
-      'about.privacy': '设置与自定义音频只保存在当前浏览器；检查/自动更新会访问 Gitee。',
+      'about.privacy': '设置与自定义音频只保存在当前浏览器，不写入会话记录；日常提醒不联网，只有检查更新时访问 Gitee。',
+      'about.copyright': 'Copyright © {author} {years}',
       'update.title': '版本与更新',
+      'update.action': '更新',
+      'update.foundTitle': '发现新版本 v{version}',
+      'update.foundDesc': '当前 v{current}。现在更新会替换运行文件，设置与自定义音频会保留。',
+      'update.updateNow': '立即更新',
+      'update.later': '稍后',
+      'update.checkingShort': '检查中…',
+      'update.updatingShort': '更新中…',
+      'update.availableShort': '发现 v{version}',
+      'update.upToDateShort': '已是最新',
+      'update.failedShort': '检查失败',
+      'update.tooSoon': '刚检查过，请稍等半分钟',
+      'update.rateLimited': 'Gitee 接口限流（403）：未登录调用每小时约 60 次，请约一小时后再试；频繁检查也会触发。',
       'update.desc': '从 Gitee 检查插件更新并热更新运行文件；日常提醒不会联网。',
       'update.current': '当前版本 v{version}',
       'update.check': '检查更新',
@@ -456,6 +538,8 @@ window.__ModuleLoader__.load({
       'update.cancel': '取消',
       'update.updating': '正在下载并应用更新…',
       'update.done': '已更新到 v{version}，页面将自动刷新。',
+      'update.cardTitle': '完成提醒已更新',
+      'update.cardBody': '已更新到 v{version}',
       'update.refresh': '刷新页面',
       'update.restart': '已更新到 v{version}，重启 DSH 后生效。',
       'update.error': '更新失败：{reason}',
@@ -552,17 +636,24 @@ window.__ModuleLoader__.load({
       'scope.waiting': '待回答时提醒',
       'scope.waiting.desc': '会话请你回答问题、确认计划或授权操作时，也弹窗提醒。',
       'uninstall.action': '卸载插件',
+      'uninstall.button': '卸载',
       'uninstall.confirmTitle': '确定卸载「完成提醒」？',
       'uninstall.confirmDesc': '卸载后需要重新安装才能恢复完成与待回答提醒。',
       'uninstall.cancel': '取消',
       'uninstall.confirm': '确认卸载',
       'uninstall.busy': '正在卸载…',
+      'uninstall.cleanup': '正在清理残留文件…',
       'uninstall.done': '已卸载。若界面仍在，刷新页面即可。',
+      'uninstall.doneReload': '已卸载，正在刷新页面…',
+      'uninstall.doneCleaned': '已卸载，并清理了 {count} 个残留项，正在刷新页面…',
       'uninstall.restart': '已卸载，重启 DSH 后生效。',
       'uninstall.cancelled': '已取消卸载。',
       'uninstall.manual': '当前进程无法热卸载，请在左侧「插件」页中卸载。',
       'uninstall.failed': '卸载失败：{reason}',
       'uninstall.failedGeneric': '未知错误',
+      'uninstall.code.notRemovable': '这个插件在当前部署里被锁定，不能从插件内卸载，请到左侧「插件」页卸载。',
+      'uninstall.code.stopProfile': '当前进程不能热卸载，请到左侧「插件」页卸载，或重启 DSH 后再试。',
+      'uninstall.code.bundleInUse': '插件仍在使用中，请稍等几秒重试，或重启 DSH 后再卸载。',
       'uninstall.refresh': '刷新页面',
       'uninstall.retry': '重试',
       'uninstall.close': '关闭',
@@ -613,14 +704,33 @@ window.__ModuleLoader__.load({
       'settings.master.desc': 'When off, completion, failure, and waiting-for-answer alerts stop and no sound plays. The sidebar entry stays available so you can turn it back on at any time.',
       'settings.master.on': 'On',
       'settings.master.off': 'Off',
-      'settings.note': 'These preferences and any custom audio stay in this browser. Normal reminders never touch the network; Gitee is contacted only when you check for updates or the daily check runs.',
+      'placement.section': 'Entry point',
+      'placement.title': 'Show in the left sidebar',
+      'placement.desc': 'When off, it lives on its Plugins page. Takes effect immediately.',
+      'placement.summarySidebar': 'Sidebar entry: shown',
+      'placement.summaryPlugins': 'Sidebar entry: tucked into the Plugins page',
+      'placement.open': 'Open completion alert settings',
       'about.title': 'About',
       'about.name': 'DSH Session Completion Alerts',
       'about.tagline': 'Built for every DSH session ending: gentle alerts for completion, failure, and waiting-for-answer states, with failure reasons, question/plan/approval alerts, multiple short sounds, workspace access, Windows notifications, and a desktop floating window.',
+      'about.author': 'By {name}',
       'about.license': 'AGPL-3.0',
       'about.repo': 'Gitee repository',
-      'about.privacy': 'Settings and custom audio stay in this browser; update checks contact Gitee.',
+      'about.privacy': 'Settings and custom audio stay in this browser and never enter session logs. Normal reminders never touch the network; only update checks contact Gitee.',
+      'about.copyright': 'Copyright © {author} {years}',
       'update.title': 'Version and updates',
+      'update.action': 'Update',
+      'update.foundTitle': 'Version {version} is available',
+      'update.foundDesc': 'You are on v{current}. Updating replaces the runtime files; settings and custom audio are kept.',
+      'update.updateNow': 'Update now',
+      'update.later': 'Later',
+      'update.checkingShort': 'Checking…',
+      'update.updatingShort': 'Updating…',
+      'update.availableShort': 'v{version} available',
+      'update.upToDateShort': 'Up to date',
+      'update.failedShort': 'Check failed',
+      'update.tooSoon': 'Just checked, give it half a minute',
+      'update.rateLimited': 'Gitee API rate limit (403): anonymous calls are capped at about 60 per hour. Try again in roughly an hour; frequent checks count too.',
       'update.desc': 'Check Gitee and hot-update the runtime files. Normal reminders never touch the network.',
       'update.current': 'Current version v{version}',
       'update.check': 'Check for updates',
@@ -634,6 +744,8 @@ window.__ModuleLoader__.load({
       'update.cancel': 'Cancel',
       'update.updating': 'Downloading and applying the update…',
       'update.done': 'Updated to v{version}. The page will refresh automatically.',
+      'update.cardTitle': 'Completion alerts updated',
+      'update.cardBody': 'Updated to v{version}',
       'update.refresh': 'Refresh page',
       'update.restart': 'Updated to v{version}. Restart DSH to finish.',
       'update.error': 'Update failed: {reason}',
@@ -730,17 +842,24 @@ window.__ModuleLoader__.load({
       'scope.waiting': 'Alert when an answer is needed',
       'scope.waiting.desc': 'Also show a card when a session asks a question, needs plan review, or requests approval.',
       'uninstall.action': 'Uninstall plugin',
+      'uninstall.button': 'Uninstall',
       'uninstall.confirmTitle': 'Uninstall "Completion alerts"?',
       'uninstall.confirmDesc': 'You will need to install it again to restore completion and waiting alerts.',
       'uninstall.cancel': 'Cancel',
       'uninstall.confirm': 'Uninstall',
       'uninstall.busy': 'Uninstalling…',
+      'uninstall.cleanup': 'Cleaning up leftover files…',
       'uninstall.done': 'Uninstalled. Refresh the page if it is still visible.',
+      'uninstall.doneReload': 'Uninstalled. Reloading the page…',
+      'uninstall.doneCleaned': 'Uninstalled and cleaned {count} leftover item(s). Reloading the page…',
       'uninstall.restart': 'Uninstalled. Restart DSH to finish.',
       'uninstall.cancelled': 'Uninstall cancelled.',
       'uninstall.manual': 'This process cannot unload it live. Use the Plugins page in the sidebar.',
       'uninstall.failed': 'Could not uninstall: {reason}',
       'uninstall.failedGeneric': 'Unknown error',
+      'uninstall.code.notRemovable': 'This deployment keeps the plugin locked; uninstall it from the Plugins page in the sidebar.',
+      'uninstall.code.stopProfile': 'This process cannot unload it live. Use the Plugins page, or restart DSH and try again.',
+      'uninstall.code.bundleInUse': 'The plugin is still in use. Wait a few seconds and retry, or restart DSH and uninstall again.',
       'uninstall.refresh': 'Refresh page',
       'uninstall.retry': 'Retry',
       'uninstall.close': 'Close',
@@ -769,6 +888,7 @@ window.__ModuleLoader__.load({
       const source = raw && typeof raw === 'object' ? raw : {};
       return {
         enabled: typeof source.enabled === 'boolean' ? source.enabled : DEFAULT_SETTINGS.enabled,
+        sidebarEntry: source.sidebarEntry === 'plugins' ? 'plugins' : DEFAULT_SETTINGS.sidebarEntry,
         deliveryMode: source.deliveryMode === 'desktop' || source.deliveryMode === 'inApp' || source.deliveryMode === 'floating' || source.deliveryMode === 'auto'
           ? source.deliveryMode
           : DEFAULT_SETTINGS.deliveryMode,
@@ -921,10 +1041,10 @@ window.__ModuleLoader__.load({
 
     const demoListeners = new Set();
 
-    function requestDemo(kind) {
+    function requestDemo(kind, extra) {
       for (const listener of [...demoListeners]) {
         try {
-          listener(kind);
+          listener(kind, extra);
         } catch {
           /* ignore */
         }
@@ -998,12 +1118,19 @@ window.__ModuleLoader__.load({
       );
     }
 
-    function TrashIcon({ size = 16 }) {
+    function UpdateIcon({ size = 15 }) {
       return h('svg', iconProps(size),
-        h('path', { d: 'M4.5 6.8h15' }),
-        h('path', { d: 'M9 6.8V5.2a1.4 1.4 0 0 1 1.4-1.4h3.2A1.4 1.4 0 0 1 15 5.2v1.6' }),
-        h('path', { d: 'M6.3 6.8l.8 12a1.6 1.6 0 0 0 1.6 1.5h6.6a1.6 1.6 0 0 0 1.6-1.5l.8-12' }),
-        h('path', { d: 'M10 10.8v5.8M14 10.8v5.8' }),
+        h('path', { d: 'M20.1 12a8.1 8.1 0 1 1-2.7-6.1' }),
+        h('path', { d: 'M20.3 3.7v4.9h-4.9' }),
+      );
+    }
+
+    function UninstallIcon({ size = 16 }) {
+      return h('svg', iconProps(size),
+        h('rect', { x: 4.7, y: 10.4, width: 14.6, height: 9.1, rx: 2.3 }),
+        h('path', { d: 'M4.7 14.1h14.6' }),
+        h('path', { d: 'M12 9.4V4.1' }),
+        h('path', { d: 'm9.4 6.7 2.6-2.6 2.6 2.6' }),
       );
     }
 
@@ -1020,21 +1147,54 @@ window.__ModuleLoader__.load({
         focusable: 'false',
         'aria-hidden': 'true',
       },
-        h('circle', { cx: 6, cy: 6.6, r: 3.7, fill: 'currentColor', opacity: 0.45 }),
-        h('circle', { cx: 18, cy: 6.6, r: 3.7, fill: 'currentColor', opacity: 0.45 }),
+        h('circle', { cx: 7.2, cy: 7.6, r: 2.9, fill: 'currentColor' }),
+        h('circle', { cx: 16.8, cy: 7.6, r: 2.9, fill: 'currentColor' }),
+        h('circle', { cx: 12, cy: 13.6, r: 7.3, fill: 'currentColor' }),
+        h('circle', { cx: 9.5, cy: 13, r: 1.15, fill: 'var(--dsw-alias-bg-base)' }),
+        h('circle', { cx: 14.5, cy: 13, r: 1.15, fill: 'var(--dsw-alias-bg-base)' }),
         h('path', {
-          d: 'M3.3 13.1c0-4.8 3.9-8.7 8.7-8.7s8.7 3.9 8.7 8.7v.7c0 4.8-3.9 8.7-8.7 8.7S3.3 18.6 3.3 13.8v-.7Z',
-          fill: 'currentColor',
-        }),
-        h('circle', { cx: 9, cy: 12, r: 1.35, fill: 'var(--dsw-alias-bg-base)' }),
-        h('circle', { cx: 15, cy: 12, r: 1.35, fill: 'var(--dsw-alias-bg-base)' }),
-        h('path', {
-          d: 'M10 15.3c.65.9 1.3 1.35 2 1.35s1.35-.45 2-1.35',
+          d: 'M10.8 15.8c.4.5.8.8 1.2.8s.8-.3 1.2-.8',
           stroke: 'var(--dsw-alias-bg-base)',
-          strokeWidth: 1.5,
+          strokeWidth: 1.4,
           strokeLinecap: 'round',
         }),
       ));
+    }
+
+    /*
+     * The plugin page's own configuration cell: it mirrors the sidebar switch, so
+     * the settings stay reachable after the sidebar entry is tucked away.
+     */
+    function PluginPlacementCell({ view }) {
+      const current = useSettings();
+      const tr = (key, params) => translate(key, params);
+      const inSidebar = current.sidebarEntry !== 'plugins';
+      if (view === 'summary') {
+        return h('span', { className: 'dcd-plugin-summary' },
+          tr(inSidebar ? 'placement.summarySidebar' : 'placement.summaryPlugins'));
+      }
+      return h('div', { className: 'dcd-plugin-config' },
+        h('div', { className: 'dcd-plugin-config-head' },
+          h('div', { className: 'dcd-plugin-config-copy' },
+            h('div', { className: 'dcd-plugin-config-title' }, tr('placement.title')),
+            h('div', { className: 'dcd-plugin-config-desc' }, tr('placement.desc')),
+          ),
+          h(Switch, {
+            checked: inSidebar,
+            label: tr('placement.title'),
+            onChange: (value) => saveSettings({ sidebarEntry: value ? 'sidebar' : 'plugins' }),
+          }),
+        ),
+        runtime.openPanelAvailable
+          ? h('button', {
+            type: 'button',
+            className: 'dcd-btn dcd-btn-small',
+            onClick: () => {
+              if (runtime.openPanel) runtime.openPanel();
+            },
+          }, tr('placement.open'))
+          : null,
+      );
     }
 
     function JellyMascot({ size = 56, mood = 'happy' }) {
@@ -1462,6 +1622,7 @@ window.__ModuleLoader__.load({
       const [deliveryError, setDeliveryError] = React.useState('');
       const [floatingReady, setFloatingReady] = React.useState(Boolean(floatingState.host));
       const [confirmingUninstall, setConfirmingUninstall] = React.useState(false);
+      const [confirmingUpdate, setConfirmingUpdate] = React.useState(false);
       const [uninstall, setUninstall] = React.useState({ status: 'idle', message: '' });
       const [update, setUpdate] = React.useState({
         status: 'idle',
@@ -1471,6 +1632,8 @@ window.__ModuleLoader__.load({
         repoUrl: UPDATE_REPO_URL,
       });
       const fileInput = React.useRef(null);
+      const lastCheckAt = React.useRef(0);
+      const [checkHint, setCheckHint] = React.useState('');
 
       const updateRequest = async (action, extra = {}) => {
         const response = await globalThis.fetch(UPDATE_ROUTE, {
@@ -1491,6 +1654,7 @@ window.__ModuleLoader__.load({
 
       const updateFailure = (error) => {
         const reason = error instanceof Error ? error.message : String(error);
+        if (/rate\s*limit|限流|403/i.test(reason)) return tr('update.rateLimited');
         const offline = /fetch|network|connect|timeout|gitee 5\d\d/i.test(reason);
         return offline
           ? tr('update.offline')
@@ -1512,10 +1676,41 @@ window.__ModuleLoader__.load({
               : tr('update.upToDate'),
             repoUrl: result.repoUrl || UPDATE_REPO_URL,
           });
+          /* A manual check that finds a newer build offers to apply it at once. */
+          if (result.available) setConfirmingUpdate(true);
         } catch (error) {
           setUpdate((value) => ({ ...value, status: 'error', message: updateFailure(error) }));
         }
       };
+
+      /*
+       * The hero's 更新 button runs one manual check in place, without moving the
+       * page: the result shows under the button and in the version card below.
+       * Gitee limits anonymous API calls, so clicks inside the cooldown only hint.
+       */
+      const runUpdateCheck = () => {
+        if (update.status === 'checking' || update.status === 'updating') return;
+        const now = Date.now();
+        if (now - lastCheckAt.current < MANUAL_CHECK_COOLDOWN_MS) {
+          setCheckHint(tr('update.tooSoon'));
+          globalThis.setTimeout(() => setCheckHint(''), 2600);
+          return;
+        }
+        lastCheckAt.current = now;
+        checkForUpdate();
+      };
+
+      const updateNote = checkHint || (update.status === 'checking'
+        ? tr('update.checkingShort')
+        : update.status === 'updating'
+          ? tr('update.updatingShort')
+          : update.status === 'available'
+            ? tr('update.availableShort', { version: update.latestVersion })
+            : update.status === 'latest'
+              ? tr('update.upToDateShort')
+              : update.status === 'error'
+                ? tr('update.failedShort')
+                : '');
 
       const applyUpdate = async () => {
         const latestVersion = update.latestVersion;
@@ -1525,6 +1720,7 @@ window.__ModuleLoader__.load({
           const result = await updateRequest('apply', { version: latestVersion });
           if (result.applied === false) {
             setUpdate((value) => ({ ...value, status: 'latest', message: tr('update.upToDate') }));
+            setConfirmingUpdate(false);
             return;
           }
           const version = result.currentVersion || result.latestVersion || latestVersion;
@@ -1656,6 +1852,46 @@ window.__ModuleLoader__.load({
         setUninstall({ status: 'idle', message: '' });
       };
 
+      /* A failure code the dialog explains in words; otherwise its own message. */
+      const uninstallReason = (error) => {
+        const code = error && typeof error === 'object' ? error.code : undefined;
+        if (typeof code === 'string' && Object.hasOwn(UNINSTALL_CODE_KEYS, code)) {
+          return tr(UNINSTALL_CODE_KEYS[code]);
+        }
+        const message = error && error.message ? String(error.message) : '';
+        if (message && Object.hasOwn(UNINSTALL_CODE_KEYS, message)) {
+          return tr(UNINSTALL_CODE_KEYS[message]);
+        }
+        return message || tr('uninstall.failedGeneric');
+      };
+
+      /*
+       * The plugin is leaving this page: close the floating window and drop the
+       * injected stylesheet, then reload so the sidebar entry and settings page
+       * disappear instead of lingering as a ghost.
+       */
+      const releasePageAfterUninstall = () => {
+        try {
+          closeFloatingWindow(false);
+        } catch {
+          /* The window may already be closed. */
+        }
+        try {
+          for (const tag of globalThis.document.querySelectorAll('style[data-plugin-css="dsh-completed-ding"]')) {
+            tag.remove();
+          }
+        } catch {
+          /* Styling is cosmetic here. */
+        }
+        globalThis.setTimeout(() => {
+          try {
+            globalThis.location.reload();
+          } catch {
+            /* The user still has the manual refresh button. */
+          }
+        }, 900);
+      };
+
       const confirmUninstall = async () => {
         let manager = null;
         try {
@@ -1671,33 +1907,34 @@ window.__ModuleLoader__.load({
           }
           return;
         }
+        setUninstall({ status: 'busy', message: tr('uninstall.cleanup') });
+        let cleaned = 0;
+        try {
+          const leftovers = await cleanupInstallLeftovers();
+          cleaned = leftovers && Array.isArray(leftovers.removed) ? leftovers.removed.length : 0;
+        } catch {
+          /* Host halves without the cleanup route still uninstall through the manager. */
+        }
         setUninstall({ status: 'busy', message: tr('uninstall.busy') });
         try {
           const answer = await manager.removeBundle('dsh-completed-ding');
           if (!answer || !answer.ok) {
-            const reason = answer && answer.error && answer.error.message
-              ? answer.error.message
-              : tr('uninstall.failedGeneric');
-            setUninstall({ status: 'error', message: tr('uninstall.failed', { reason }) });
+            setUninstall({
+              status: 'error',
+              message: tr('uninstall.failed', { reason: uninstallReason(answer && answer.error) }),
+            });
             return;
           }
           const value = answer.value || {};
           if (value.error && value.error.code === 'stop-profile') {
-            setUninstall({ status: 'manual', message: tr('uninstall.manual') });
+            setUninstall({ status: 'manual', message: tr('uninstall.code.stopProfile') });
             return;
           }
           if (value.application === 'failed') {
-            const reason = value.error && (value.error.diagnostic || value.error.code)
-              ? value.error.diagnostic || value.error.code
-              : tr('uninstall.failedGeneric');
-            setUninstall({ status: 'error', message: tr('uninstall.failed', { reason }) });
-            return;
-          }
-          if (value.application === 'failed') {
-            const reason = value.error && (value.error.diagnostic || value.error.code)
-              ? value.error.diagnostic || value.error.code
-              : tr('uninstall.failedGeneric');
-            setUninstall({ status: 'error', message: tr('uninstall.failed', { reason }) });
+            setUninstall({
+              status: 'error',
+              message: tr('uninstall.failed', { reason: uninstallReason(value.error) }),
+            });
             return;
           }
           if (value.application === 'cancelled') {
@@ -1708,10 +1945,15 @@ window.__ModuleLoader__.load({
             setUninstall({ status: 'restart', message: tr('uninstall.restart') });
             return;
           }
-          setUninstall({ status: 'done', message: tr('uninstall.done') });
+          setUninstall({
+            status: 'done',
+            message: cleaned > 0
+              ? tr('uninstall.doneCleaned', { count: String(cleaned) })
+              : tr('uninstall.doneReload'),
+          });
+          releasePageAfterUninstall();
         } catch (error) {
-          const reason = error instanceof Error ? error.message : String(error);
-          setUninstall({ status: 'error', message: tr('uninstall.failed', { reason }) });
+          setUninstall({ status: 'error', message: tr('uninstall.failed', { reason: uninstallReason(error) }) });
         }
       };
 
@@ -1784,16 +2026,47 @@ window.__ModuleLoader__.load({
               h('h1', { className: 'dcd-hero-title' }, tr('settings.title')),
               h('p', { className: 'dcd-hero-subtitle' }, tr('settings.subtitle')),
             ),
-            h('button', {
-              type: 'button',
-              className: 'dcd-uninstall-icon',
-              title: tr('uninstall.action'),
-              'aria-label': tr('uninstall.action'),
-              onClick: () => {
-                setConfirmingUninstall(true);
-                setUninstall({ status: 'idle', message: '' });
-              },
-            }, h(TrashIcon, { size: 16 })),
+            h('div', { className: 'dcd-hero-actions' },
+              h('div', { className: 'dcd-hero-action-row' },
+                h('button', {
+                  type: 'button',
+                  className: 'dcd-hero-action',
+                  'data-kind': 'update',
+                  title: tr('update.action'),
+                  'aria-label': tr('update.action'),
+                  disabled: update.status === 'checking' || update.status === 'updating',
+                  onClick: runUpdateCheck,
+                },
+                  h(UpdateIcon, { size: 15 }),
+                  h('span', { className: 'dcd-hero-action-label' }, tr('update.action')),
+                ),
+                h('button', {
+                  type: 'button',
+                  className: 'dcd-hero-action',
+                  'data-kind': 'uninstall',
+                  title: tr('uninstall.action'),
+                  'aria-label': tr('uninstall.action'),
+                  onClick: () => {
+                    setConfirmingUninstall(true);
+                    setUninstall({ status: 'idle', message: '' });
+                  },
+                },
+                  h(UninstallIcon, { size: 16 }),
+                  h('span', { className: 'dcd-hero-action-label' }, tr('uninstall.button')),
+                ),
+              ),
+              updateNote
+                ? (update.status === 'available' && !checkHint
+                  ? h('button', {
+                    type: 'button',
+                    className: 'dcd-hero-note',
+                    'data-tone': 'available',
+                    title: tr('update.updateNow'),
+                    onClick: () => setConfirmingUpdate(true),
+                  }, `${updateNote} · ${tr('update.updateNow')}`)
+                  : h('div', { className: 'dcd-hero-note', 'data-tone': update.status, role: 'status' }, updateNote))
+                : null,
+            ),
           ),
           h('section', {
             className: `dcd-master${current.enabled ? '' : ' dcd-master--off'}`,
@@ -1813,6 +2086,18 @@ window.__ModuleLoader__.load({
                 onChange: (value) => set({ enabled: value }),
               }),
             ),
+          ),
+          h(SettingCard, {
+            title: tr('placement.section'),
+          },
+            h(SettingRow, {
+              title: tr('placement.title'),
+              desc: tr('placement.desc'),
+            }, h(Switch, {
+              checked: current.sidebarEntry !== 'plugins',
+              label: tr('placement.title'),
+              onChange: (value) => set({ sidebarEntry: value ? 'sidebar' : 'plugins' }),
+            })),
           ),
           h('div', { className: 'dcd-actions' },
             h('button', {
@@ -2150,17 +2435,22 @@ window.__ModuleLoader__.load({
           ),
 
           h('section', { className: 'dcd-about' },
-            h('div', { className: 'dcd-about-heading' }, tr('about.title')),
+            h('div', { className: 'dcd-about-top' },
+              h('div', { className: 'dcd-about-heading' }, tr('about.title')),
+              h('span', { className: 'dcd-about-version' }, `v${PLUGIN_VERSION}`),
+            ),
             h('div', { className: 'dcd-about-head' },
               h('div', { className: 'dcd-about-mark' }, h(CheckIcon, { size: 18 })),
               h('div', { className: 'dcd-about-copy' },
                 h('div', { className: 'dcd-about-title' }, tr('about.name')),
                 h('div', { className: 'dcd-about-tagline' }, tr('about.tagline')),
               ),
-              h('span', { className: 'dcd-about-version' }, `v${PLUGIN_VERSION}`),
             ),
             h('div', { className: 'dcd-about-meta' },
-              h('span', { className: 'dcd-about-pill' }, tr('about.license')),
+              h('span', null, tr('about.author', { name: AUTHOR_NAME })),
+              h('span', { className: 'dcd-about-sep', 'aria-hidden': 'true' }, '·'),
+              h('span', null, tr('about.license')),
+              h('span', { className: 'dcd-about-sep', 'aria-hidden': 'true' }, '·'),
               h('a', {
                 className: 'dcd-about-link',
                 href: UPDATE_REPO_URL,
@@ -2168,10 +2458,11 @@ window.__ModuleLoader__.load({
                 rel: 'noreferrer',
               }, tr('about.repo')),
             ),
-            h('p', { className: 'dcd-about-note' }, tr('about.privacy')),
+            h('div', { className: 'dcd-about-footer' },
+              h('div', { className: 'dcd-about-copyright' }, tr('about.copyright', { author: AUTHOR_NAME, years: copyrightYears() })),
+              h('p', { className: 'dcd-about-note' }, tr('about.privacy')),
+            ),
           ),
-
-          h('p', { className: 'dcd-note' }, tr('settings.note')),
 
           confirmingUninstall
             ? h('div', {
@@ -2186,7 +2477,7 @@ window.__ModuleLoader__.load({
                 onClick: (event) => event.stopPropagation(),
               },
                 h('div', { className: 'dcd-uninstall-dialog-head' },
-                  h('span', { className: 'dcd-uninstall-dialog-icon' }, h(TrashIcon, { size: 18 })),
+                  h('span', { className: 'dcd-uninstall-dialog-icon' }, h(UninstallIcon, { size: 18 })),
                   h('div', { className: 'dcd-uninstall-dialog-copy' },
                     h('div', { className: 'dcd-uninstall-dialog-title' }, tr('uninstall.confirmTitle')),
                     h('div', { className: 'dcd-uninstall-dialog-desc' }, tr('uninstall.confirmDesc')),
@@ -2230,6 +2521,52 @@ window.__ModuleLoader__.load({
                       onClick: confirmUninstall,
                     }, uninstall.status === 'error' ? tr('uninstall.retry') : tr('uninstall.confirm'))
                     : null,
+                ),
+              ),
+            )
+            : null,
+
+          confirmingUpdate
+            ? h('div', {
+              className: 'dcd-uninstall-mask',
+              onClick: update.status === 'updating' ? undefined : () => setConfirmingUpdate(false),
+            },
+              h('div', {
+                className: 'dcd-uninstall-dialog',
+                'data-kind': 'update',
+                role: 'alertdialog',
+                'aria-modal': 'true',
+                'aria-label': tr('update.foundTitle', { version: update.latestVersion || '' }),
+                onClick: (event) => event.stopPropagation(),
+              },
+                h('div', { className: 'dcd-uninstall-dialog-head' },
+                  h('span', { className: 'dcd-uninstall-dialog-icon' }, h(UpdateIcon, { size: 18 })),
+                  h('div', { className: 'dcd-uninstall-dialog-copy' },
+                    h('div', { className: 'dcd-uninstall-dialog-title' }, tr('update.foundTitle', { version: update.latestVersion || '' })),
+                    h('div', { className: 'dcd-uninstall-dialog-desc' }, tr('update.foundDesc', { current: update.currentVersion || PLUGIN_VERSION })),
+                  ),
+                ),
+                update.status === 'error'
+                  ? h('div', { className: 'dcd-confirm-error', role: 'alert' }, update.message)
+                  : update.status === 'updating'
+                    ? h('div', { className: 'dcd-confirm-note', role: 'status' }, tr('update.updating'))
+                    : update.status === 'done' || update.status === 'restart'
+                      ? h('div', { className: 'dcd-confirm-note', 'data-tone': update.status, role: 'status' }, update.message)
+                      : null,
+                h('div', { className: 'dcd-confirm-actions' },
+                  h('button', {
+                    type: 'button',
+                    className: 'dcd-btn dcd-btn-ghost dcd-btn-small',
+                    disabled: update.status === 'updating',
+                    onClick: () => setConfirmingUpdate(false),
+                  }, update.status === 'available' || update.status === 'error' ? tr('update.later') : tr('uninstall.close')),
+                  update.status === 'updating' || update.status === 'done' || update.status === 'restart'
+                    ? null
+                    : h('button', {
+                      type: 'button',
+                      className: 'dcd-btn dcd-btn-primary dcd-btn-small',
+                      onClick: applyUpdate,
+                    }, update.status === 'error' ? tr('update.retry') : tr('update.updateNow')),
                 ),
               ),
             )
@@ -2673,7 +3010,7 @@ window.__ModuleLoader__.load({
         pendingCompletions.current.delete(sessionId);
       };
 
-      const makeDemoNotice = (kind) => {
+      const makeDemoNotice = (kind, extra) => {
         const list = sessionsRef.current && sessionsRef.current.list
           ? sessionsRef.current.list.getSnapshot()
           : null;
@@ -2682,6 +3019,18 @@ window.__ModuleLoader__.load({
         const workspaceState = workspacesRef.current && workspacesRef.current.list
           ? workspacesRef.current.list.getSnapshot()
           : null;
+        /* A finished update greets the user on the page the update itself reloaded. */
+        if (kind === 'updated') {
+          const version = extra && typeof extra.version === 'string' && extra.version
+            ? extra.version
+            : PLUGIN_VERSION;
+          return makeNotice(
+            { id: 'demo', displayTitle: tr('update.cardBody', { version }) },
+            workspaceState,
+            { ...settingsRef.current, showPath: false, showTask: true },
+            tr('update.cardTitle'),
+          );
+        }
         const waitingTarget = kind === 'waiting'
           ? {
             kind: 'question',
@@ -2762,12 +3111,26 @@ window.__ModuleLoader__.load({
         return typeof dispose === 'function' ? dispose : undefined;
       }, [remote]);
 
-      React.useEffect(() => subscribeDemo((kind) => {
+      React.useEffect(() => subscribeDemo((kind, extra) => {
         if (!settingsRef.current.enabled) return;
-        const next = makeDemoNotice(kind);
+        const next = makeDemoNotice(kind, extra);
         enqueue(next);
         playConfiguredSound(settingsRef.current);
       }), []);
+
+      /*
+       * A version different from the one this browser loaded last time means the
+       * runtime files were just replaced: greet the user once, then remember this
+       * version so a plain refresh stays quiet.
+       */
+      React.useEffect(() => {
+        const previous = readSeenVersion();
+        writeSeenVersion(PLUGIN_VERSION);
+        if (!previous || previous === PLUGIN_VERSION) return;
+        if (!settingsRef.current.enabled) return;
+        enqueue(makeDemoNotice('updated', { version: PLUGIN_VERSION }));
+        playConfiguredSound(settingsRef.current);
+      }, []);
 
       React.useEffect(() => {
         if (!status) return;
@@ -3084,6 +3447,7 @@ window.__ModuleLoader__.load({
 /* Shared warm honey/peach palette for the card and the settings page. */
 .dcd-toast-root,
 .dcd-update-prompt-root,
+.dcd-plugin-config,
 .dcd-page {
   --dcd-amber: #e39a45;
   --dcd-amber-deep: #b96a22;
@@ -3107,6 +3471,7 @@ window.__ModuleLoader__.load({
 
 body[data-ds-dark-theme] .dcd-toast-root,
 body[data-ds-dark-theme] .dcd-update-prompt-root,
+body[data-ds-dark-theme] .dcd-plugin-config,
 body[data-ds-dark-theme] .dcd-page {
   --dcd-amber: #ffbe72;
   --dcd-amber-deep: #ffc884;
@@ -3822,7 +4187,6 @@ body[data-ds-dark-theme] .dcd-panel-icon {
   align-items: flex-start;
   gap: 15px;
   margin-bottom: 22px;
-  padding-right: 44px;
 }
 
 .dcd-hero-mascot {
@@ -3837,6 +4201,7 @@ body[data-ds-dark-theme] .dcd-panel-icon {
 }
 
 .dcd-hero-copy {
+  flex: 1 1 auto;
   min-width: 0;
 }
 
@@ -4551,8 +4916,15 @@ body[data-ds-dark-theme] .dcd-panel-icon {
   backdrop-filter: blur(14px) saturate(1.12);
 }
 
+.dcd-about-top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 11px;
+}
+
 .dcd-about-heading {
-  margin-bottom: 10px;
   color: var(--dcd-ink);
   font-size: 13px;
   line-height: 19px;
@@ -4613,23 +4985,22 @@ body[data-ds-dark-theme] .dcd-panel-icon {
   display: flex;
   align-items: center;
   flex-wrap: wrap;
-  gap: 8px;
+  gap: 6px;
   margin-top: 12px;
+  color: var(--dcd-ink-soft);
+  font-size: 11px;
+  line-height: 17px;
 }
 
-.dcd-about-pill {
-  padding: 2px 8px;
-  border: 1px solid var(--dcd-hairline);
-  border-radius: 999px;
+.dcd-about-sep {
   color: var(--dcd-ink-soft);
-  font-size: 10.5px;
-  line-height: 16px;
+  opacity: 0.45;
 }
 
 .dcd-about-link {
   color: var(--dcd-accent-deep);
-  font-size: 11.5px;
-  line-height: 18px;
+  font-size: 11px;
+  line-height: 17px;
   text-decoration: none;
 }
 
@@ -4638,51 +5009,178 @@ body[data-ds-dark-theme] .dcd-panel-icon {
   text-underline-offset: 2px;
 }
 
-.dcd-about-note {
-  margin: 9px 0 0;
+.dcd-about-footer {
+  margin-top: 13px;
+  padding-top: 11px;
+  border-top: 1px dashed color-mix(in srgb, var(--dcd-accent) 20%, transparent);
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.dcd-about-copyright {
   color: var(--dcd-ink-soft);
-  font-size: 11px;
+  font-size: 10.5px;
   line-height: 16px;
-  opacity: 0.86;
+  letter-spacing: 0.01em;
+  font-variant-numeric: tabular-nums;
+  opacity: 0.78;
 }
 
-.dcd-note {
-  margin: 18px 2px 0;
-  font-size: 11.5px;
-  line-height: 18px;
-  color: var(--dsw-alias-label-secondary);
-  opacity: 0.82;
+.dcd-about-note {
+  margin: 0;
+  color: var(--dcd-ink-soft);
+  font-size: 10.5px;
+  line-height: 16px;
+  opacity: 0.7;
 }
 
-.dcd-uninstall-icon {
-  position: absolute;
-  top: 0;
-  right: 0;
-  width: 32px;
-  height: 32px;
-  padding: 0;
+.dcd-hero-actions {
+  flex: none;
+  margin-left: auto;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 5px;
+}
+
+.dcd-hero-action-row {
   display: inline-flex;
   align-items: center;
-  justify-content: center;
+  gap: 2px;
+}
+
+.dcd-hero-note {
+  font-size: 10.5px;
+  line-height: 15px;
+  color: var(--dcd-ink-soft);
+  opacity: 0.82;
+  white-space: nowrap;
+}
+
+.dcd-hero-note[data-tone="available"] {
+  color: var(--dcd-accent-deep);
+  opacity: 1;
+}
+
+.dcd-hero-note[data-tone="error"] {
+  color: var(--dcd-coral);
+  opacity: 1;
+}
+
+button.dcd-hero-note {
+  padding: 0;
+  border: 0;
+  background: none;
+  cursor: pointer;
+  font-family: inherit;
+  text-align: right;
+}
+
+button.dcd-hero-note:hover {
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.dcd-uninstall-dialog[data-kind="update"] {
+  border-color: color-mix(in srgb, var(--dcd-accent) 36%, transparent);
+}
+
+.dcd-uninstall-dialog[data-kind="update"] .dcd-uninstall-dialog-icon {
+  color: var(--dcd-accent-deep);
+  background: color-mix(in srgb, var(--dcd-accent) 12%, transparent);
+  border-color: color-mix(in srgb, var(--dcd-accent) 28%, transparent);
+}
+
+.dcd-hero-action {
+  height: 30px;
+  padding: 0 9px;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
   border: 1px solid transparent;
   border-radius: 10px;
   color: var(--dcd-ink-soft);
   background: transparent;
   cursor: pointer;
-  opacity: 0.72;
+  font-family: inherit;
+  font-size: 12px;
+  line-height: 1;
+  opacity: 0.78;
   transition: color 140ms ease, background 140ms ease, border-color 140ms ease, opacity 140ms ease;
 }
 
-.dcd-uninstall-icon:hover {
-  color: var(--dcd-coral);
-  background: color-mix(in srgb, var(--dcd-coral) 9%, transparent);
-  border-color: color-mix(in srgb, var(--dcd-coral) 26%, transparent);
+.dcd-hero-action-label {
+  font-weight: 620;
+  letter-spacing: 0.01em;
+}
+
+.dcd-hero-action:hover {
+  color: var(--dcd-accent-deep);
+  background: color-mix(in srgb, var(--dcd-accent) 10%, transparent);
+  border-color: color-mix(in srgb, var(--dcd-accent) 26%, transparent);
   opacity: 1;
 }
 
-.dcd-uninstall-icon:focus-visible {
-  outline: 2px solid color-mix(in srgb, var(--dcd-coral) 58%, transparent);
+.dcd-hero-action[data-kind="uninstall"]:hover {
+  color: var(--dcd-coral);
+  background: color-mix(in srgb, var(--dcd-coral) 9%, transparent);
+  border-color: color-mix(in srgb, var(--dcd-coral) 26%, transparent);
+}
+
+.dcd-hero-action:focus-visible {
+  outline: 2px solid color-mix(in srgb, var(--dcd-accent) 58%, transparent);
   outline-offset: 2px;
+}
+
+.dcd-hero-action:disabled {
+  cursor: default;
+  opacity: 0.4;
+}
+
+.dcd-plugin-summary {
+  color: var(--dsw-alias-label-secondary);
+  font-size: 12px;
+  line-height: 18px;
+}
+
+.dcd-plugin-config {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 12px 14px;
+  border: 1px solid var(--dcd-hairline);
+  border-radius: 14px;
+  background: color-mix(in srgb, var(--dcd-cream) 62%, transparent);
+}
+
+.dcd-plugin-config-head {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+}
+
+.dcd-plugin-config-copy {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.dcd-plugin-config-title {
+  font-size: 13px;
+  line-height: 20px;
+  font-weight: 650;
+  color: var(--dsw-alias-label-primary);
+}
+
+.dcd-plugin-config-desc {
+  margin-top: 2px;
+  font-size: 11.5px;
+  line-height: 18px;
+  color: var(--dsw-alias-label-secondary);
+}
+
+.dcd-plugin-config > .dcd-btn {
+  align-self: flex-start;
 }
 
 .dcd-uninstall-mask {
@@ -5274,6 +5772,20 @@ html.dcd-floating-doc body {
       const workspaces = ctx.get('workspaces');
       const remote = ctx.remote;
       runtime.remote = remote;
+      /* Used by the plugin page cell to open the settings panel it describes. */
+      let panelLayout = null;
+      try {
+        const layout = ctx.get('layout');
+        if (layout && typeof layout.selectPanel === 'function') panelLayout = layout;
+      } catch {
+        /* The layout service is optional outside the shell. */
+      }
+      runtime.openPanelAvailable = panelLayout !== null;
+      runtime.openPanel = () => {
+        if (panelLayout === null) return false;
+        panelLayout.selectPanel(PANEL_ID);
+        return true;
+      };
       runtime.openPluginManager = () => {
         try {
           const navigation = ctx.get('pluginNavigation');
@@ -5312,13 +5824,47 @@ html.dcd-floating-doc body {
         locale: NS,
       }, UpdatePrompt));
 
-      ctx.slots.inject('sidebar.panellist', () => ctx.slots.register({
-        name: 'sidebar.panellist',
-        id: PANEL_ID,
-        order: 30,
-        locale: NS,
-        label: () => t('panel.label'),
-      }, PanelIcon));
+      /*
+       * The sidebar entry is optional: users may tuck the plugin into its row on
+       * the Plugins page instead. The registration follows the setting live, so
+       * toggling it needs no refresh.
+       */
+      let disposeSidebarEntry = null;
+      const mountSidebarEntry = () => {
+        if (disposeSidebarEntry !== null) return;
+        disposeSidebarEntry = ctx.slots.register({
+          name: 'sidebar.panellist',
+          id: PANEL_ID,
+          order: 30,
+          locale: NS,
+          label: () => t('panel.label'),
+        }, PanelIcon);
+      };
+      const unmountSidebarEntry = () => {
+        if (disposeSidebarEntry === null) return;
+        const dispose = disposeSidebarEntry;
+        disposeSidebarEntry = null;
+        dispose();
+      };
+      const syncSidebarEntry = () => {
+        if (getSettings().sidebarEntry === 'plugins') unmountSidebarEntry();
+        else mountSidebarEntry();
+      };
+
+      ctx.slots.inject('sidebar.panellist', () => {
+        syncSidebarEntry();
+        const stop = subscribeSettings(syncSidebarEntry);
+        return () => {
+          stop();
+          unmountSidebarEntry();
+        };
+      });
+
+      /* The Plugins page row that hosts the same switch when the entry is tucked away. */
+      ctx.slots.inject('plugins.bundle.config', () => ctx.slots.register({
+        name: 'plugins.bundle.config',
+        key: PACKAGE_NAME,
+      }, PluginPlacementCell));
 
       ctx.slots.inject('main', () => ctx.slots.register({
         name: 'main',
